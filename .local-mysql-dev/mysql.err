@@ -1,0 +1,22 @@
+2026-05-12T09:18:28.013155Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+2026-05-12T09:18:28.156929Z 0 [System] [MY-010116] [Server] /opt/homebrew/opt/mysql/bin/mysqld (mysqld 9.0.1) starting as process 56833
+2026-05-12T09:18:28.159541Z 0 [Warning] [MY-010159] [Server] Setting lower_case_table_names=2 because file system for /Users/ann/Downloads/ESO/项目代码/ESO/.local-mysql-dev/ is case insensitive
+2026-05-12T09:18:28.168032Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-05-12T09:18:28.211157Z 1 [ERROR] [MY-013039] [InnoDB] Can't create UNDO tablespace innodb_undo_001  since './undo_001' already exists.
+2026-05-12T09:18:28.212227Z 1 [ERROR] [MY-012930] [InnoDB] Plugin initialization aborted with error Generic error.
+2026-05-12T09:18:28.216907Z 1 [ERROR] [MY-010334] [Server] Failed to initialize DD Storage Engine
+2026-05-12T09:18:28.217018Z 0 [ERROR] [MY-010020] [Server] Data Dictionary initialization failed.
+2026-05-12T09:18:28.217034Z 0 [ERROR] [MY-010119] [Server] Aborting
+2026-05-12T09:18:28.224589Z 0 [System] [MY-010910] [Server] /opt/homebrew/opt/mysql/bin/mysqld: Shutdown complete (mysqld 9.0.1)  Homebrew.
+2026-05-12T09:18:28.224613Z 0 [System] [MY-015016] [Server] MySQL Server - end.
+2026-05-12T09:19:20.774932Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+2026-05-12T09:19:20.925432Z 0 [System] [MY-010116] [Server] /opt/homebrew/opt/mysql/bin/mysqld (mysqld 9.0.1) starting as process 57395
+2026-05-12T09:19:20.930357Z 0 [Warning] [MY-010159] [Server] Setting lower_case_table_names=2 because file system for /Users/ann/Downloads/ESO/项目代码/ESO/.local-mysql-dev/ is case insensitive
+2026-05-12T09:19:20.960071Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+2026-05-12T09:19:21.009500Z 1 [ERROR] [MY-013039] [InnoDB] Can't create UNDO tablespace innodb_undo_002  since '/Users/ann/Downloads/ESO/项目代码/ESO/.local-mysql-dev/undo_002' already exists.
+2026-05-12T09:19:21.009862Z 1 [ERROR] [MY-012930] [InnoDB] Plugin initialization aborted with error Generic error.
+2026-05-12T09:19:21.013120Z 1 [ERROR] [MY-010334] [Server] Failed to initialize DD Storage Engine
+2026-05-12T09:19:21.013206Z 0 [ERROR] [MY-010020] [Server] Data Dictionary initialization failed.
+2026-05-12T09:19:21.013222Z 0 [ERROR] [MY-010119] [Server] Aborting
+2026-05-12T09:19:21.023200Z 0 [System] [MY-010910] [Server] /opt/homebrew/opt/mysql/bin/mysqld: Shutdown complete (mysqld 9.0.1)  Homebrew.
+2026-05-12T09:19:21.023226Z 0 [System] [MY-015016] [Server] MySQL Server - end.

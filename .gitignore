@@ -1,0 +1,8 @@
+*.xlsx
+*.xls
+*.csv
+.env
+__pycache__/
+*.pyc
+node_modules/
+dist/
