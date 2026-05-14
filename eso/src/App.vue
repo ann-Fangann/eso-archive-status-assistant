@@ -14,7 +14,11 @@
         >
           <el-menu-item index="excel">
             <el-icon><Document /></el-icon>
-            <span>多源Excel数据融合平台</span>
+            <span>ESO未完成清单</span>
+          </el-menu-item>
+          <el-menu-item index="drawing">
+            <el-icon><Document /></el-icon>
+            <span>图纸未完成清单</span>
           </el-menu-item>
           <el-menu-item index="chatbot">
             <el-icon><ChatDotRound /></el-icon>
@@ -26,6 +30,9 @@
       <main class="main-content">
         <div v-show="activeComponent === 'excel'" class="content-wrapper">
           <ExcelMatcher />
+        </div>
+        <div v-show="activeComponent === 'drawing'" class="content-wrapper">
+          <DrawingMatcher />
         </div>
         <div v-show="activeComponent === 'chatbot'" class="content-wrapper">
           <ChatBot />
@@ -40,6 +47,7 @@
 <script setup>
 import { ref } from 'vue'
 import ExcelMatcher from './components/ExcelMatcher.vue'
+import DrawingMatcher from './components/DrawingMatcher.vue'
 import ChatBot from './components/ChatBot.vue'
 
 const activeComponent = ref('excel')

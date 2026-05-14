@@ -346,6 +346,51 @@ def resolve_target_date(target_date: str | None) -> date:
     except ValueError:
         raise HTTPException(status_code=400, detail="统计日期格式错误，应为 YYYY-MM-DD")
 
+def quote_identifier(name: str) -> str:
+    """为 MySQL 标识符加反引号，避免中文列名或特殊列名造成 SQL 歧义。"""
+    return f"`{str(name).replace('`', '``')}`"
+
+def build_duplicate_part_stats(conn, table_name: str, table_columns: List[str]):
+    """统计重复零件号，先暴露风险，不在业务规则未确认前擅自去重。"""
+    if '零件号' not in table_columns:
+        return {
+            "duplicate_part_count": 0,
+            "duplicate_row_count": 0,
+            "samples": [],
+        }
+
+    table_ident = quote_identifier(table_name)
+    part_ident = quote_identifier('零件号')
+    duplicate_summary_sql = f"""
+    SELECT
+        COUNT(*) AS duplicate_part_count,
+        COALESCE(SUM(row_count), 0) AS duplicate_row_count
+    FROM (
+        SELECT {part_ident}, COUNT(*) AS row_count
+        FROM {table_ident}
+        WHERE {part_ident} IS NOT NULL AND TRIM({part_ident}) != ''
+        GROUP BY {part_ident}
+        HAVING COUNT(*) > 1
+    ) duplicate_parts;
+    """
+    duplicate_samples_sql = f"""
+    SELECT {part_ident} AS 零件号, COUNT(*) AS count
+    FROM {table_ident}
+    WHERE {part_ident} IS NOT NULL AND TRIM({part_ident}) != ''
+    GROUP BY {part_ident}
+    HAVING COUNT(*) > 1
+    ORDER BY count DESC
+    LIMIT 20;
+    """
+
+    summary = conn.execute(text(duplicate_summary_sql)).mappings().first() or {}
+    samples = [dict(row) for row in conn.execute(text(duplicate_samples_sql)).mappings().all()]
+    return {
+        "duplicate_part_count": int(summary.get("duplicate_part_count") or 0),
+        "duplicate_row_count": int(summary.get("duplicate_row_count") or 0),
+        "samples": samples,
+    }
+
 def build_unfinished_select_result(conn, resolved_target_date: date, matched_completed_count=None):
     """基于当前 sheet 表，按统计日期生成未完成清单和汇总。"""
     try:
@@ -359,14 +404,27 @@ def build_unfinished_select_result(conn, resolved_target_date: date, matched_com
     if missing_main_cols:
         raise HTTPException(status_code=400, detail=f"主表(sheet)缺少必要列: {missing_main_cols}")
 
+    plan_col = quote_identifier('ESO_Plan_Date')
+    actual_col = quote_identifier('ESO_Actual_Date')
+    operation_col = quote_identifier('操作类型')
+    has_operation_col = '操作类型' in main_columns
+    active_row_condition = (
+        f"({operation_col} IS NULL OR UPPER(TRIM({operation_col})) != 'D')"
+        if has_operation_col else "1 = 1"
+    )
+    delete_row_condition = (
+        f"({operation_col} IS NOT NULL AND UPPER(TRIM({operation_col})) = 'D')"
+        if has_operation_col else "0 = 1"
+    )
+
     plan_valid_condition = """
-    ESO_Plan_Date IS NOT NULL
-    AND TRIM(ESO_Plan_Date) != ''
-    AND UPPER(TRIM(ESO_Plan_Date)) NOT IN ('NA', 'N/A', 'NANA', 'NONE', 'NULL', 'NAN')
-    """
-    plan_date_expr = """
+    {plan_col} IS NOT NULL
+    AND TRIM({plan_col}) != ''
+    AND UPPER(TRIM({plan_col})) NOT IN ('NA', 'N/A', 'NANA', 'NONE', 'NULL', 'NAN')
+    """.format(plan_col=plan_col)
+    plan_date_expr = f"""
     STR_TO_DATE(
-        REPLACE(SUBSTRING_INDEX(TRIM(ESO_Plan_Date), ' ', 1), '/', '-'),
+        REPLACE(SUBSTRING_INDEX(TRIM({plan_col}), ' ', 1), '/', '-'),
         '%Y-%m-%d'
     )
     """
@@ -375,39 +433,52 @@ def build_unfinished_select_result(conn, resolved_target_date: date, matched_com
     AND {plan_date_expr} IS NOT NULL
     AND {plan_date_expr} <= :target_date
     """
-    actual_filled_condition = """
-    ESO_Actual_Date IS NOT NULL
-    AND TRIM(ESO_Actual_Date) != ''
+    actual_filled_condition = f"""
+    {actual_col} IS NOT NULL
+    AND TRIM({actual_col}) != ''
     """
     actual_empty_condition = f"NOT ({actual_filled_condition})"
+    active_plan_due_unfinished_condition = f"""
+    {active_row_condition}
+    AND {plan_due_condition}
+    AND {actual_empty_condition}
+    """
 
     summary_sql = f"""
     SELECT
-        SUM(CASE WHEN {plan_valid_condition} THEN 1 ELSE 0 END) AS planned_count,
-        SUM(CASE WHEN {plan_valid_condition} AND {actual_filled_condition} THEN 1 ELSE 0 END) AS completed_count,
-        SUM(CASE WHEN {plan_due_condition} AND {actual_empty_condition} THEN 1 ELSE 0 END) AS unfinished_count,
-        SUM(CASE WHEN {plan_due_condition} THEN 1 ELSE 0 END) AS due_planned_count,
-        SUM(CASE WHEN {plan_due_condition} AND {actual_filled_condition} THEN 1 ELSE 0 END) AS due_completed_count,
-        SUM(CASE WHEN 操作类型 = 'D' AND {actual_filled_condition} THEN 1 ELSE 0 END) AS delete_completed_count
+        SUM(CASE WHEN {active_row_condition} AND {plan_valid_condition} THEN 1 ELSE 0 END) AS planned_count,
+        SUM(CASE WHEN {active_row_condition} AND {plan_valid_condition} AND {actual_filled_condition} THEN 1 ELSE 0 END) AS completed_count,
+        SUM(CASE WHEN {active_plan_due_unfinished_condition} THEN 1 ELSE 0 END) AS unfinished_count,
+        SUM(CASE WHEN {active_row_condition} AND {plan_due_condition} THEN 1 ELSE 0 END) AS due_planned_count,
+        SUM(CASE WHEN {active_row_condition} AND {plan_due_condition} AND {actual_filled_condition} THEN 1 ELSE 0 END) AS due_completed_count,
+        SUM(CASE WHEN {delete_row_condition} THEN 1 ELSE 0 END) AS delete_row_count,
+        SUM(CASE WHEN {delete_row_condition} AND {actual_filled_condition} THEN 1 ELSE 0 END) AS delete_completed_count,
+        SUM(CASE WHEN {delete_row_condition} AND {plan_due_condition} AND {actual_empty_condition} THEN 1 ELSE 0 END) AS delete_unfinished_excluded_count
     FROM sheet;
     """
 
+    group_col = '部门' if '部门' in main_columns else '功能组' if '功能组' in main_columns else None
+    if group_col:
+        group_ident = quote_identifier(group_col)
+        group_expr = f"COALESCE(NULLIF(TRIM({group_ident}), ''), '未知{group_col}')"
+    else:
+        group_expr = "'未知功能组'"
+
     group_sql = f"""
     SELECT
-        COALESCE(NULLIF(TRIM(功能组), ''), '未知功能组') AS 功能组,
+        {group_expr} AS 功能组,
         COUNT(*) AS count
     FROM sheet
-    WHERE {plan_due_condition}
-      AND {actual_empty_condition}
-    GROUP BY COALESCE(NULLIF(TRIM(功能组), ''), '未知功能组')
+    WHERE {active_plan_due_unfinished_condition}
+    GROUP BY {group_expr}
     ORDER BY count DESC;
     """
 
+    select_columns = "*, '审批中' AS `ESO状态`" if 'ESO状态' not in main_columns else "*"
     select_sql = f"""
-    SELECT *
+    SELECT {select_columns}
     FROM sheet
-    WHERE {plan_due_condition}
-      AND {actual_empty_condition};
+    WHERE {active_plan_due_unfinished_condition};
     """
 
     query_params = {"target_date": resolved_target_date.isoformat()}
@@ -417,7 +488,9 @@ def build_unfinished_select_result(conn, resolved_target_date: date, matched_com
     unfinished_count = int(summary_result.get("unfinished_count") or 0)
     due_planned_count = int(summary_result.get("due_planned_count") or 0)
     due_completed_count = int(summary_result.get("due_completed_count") or 0)
+    delete_row_count = int(summary_result.get("delete_row_count") or 0)
     delete_completed_count = int(summary_result.get("delete_completed_count") or 0)
+    delete_unfinished_excluded_count = int(summary_result.get("delete_unfinished_excluded_count") or 0)
 
     group_result = conn.execute(text(group_sql), query_params)
     group_rows = [dict(row) for row in group_result.mappings().all()]
@@ -426,6 +499,18 @@ def build_unfinished_select_result(conn, resolved_target_date: date, matched_com
     columns = result.keys()
     rows = [dict(zip(columns, row)) for row in result.fetchall()]
     logger.info(f"未完成清单查询成功，统计日期 {resolved_target_date.isoformat()}，返回 {len(rows)} 条记录")
+    duplicate_stats = {
+        "sheet": build_duplicate_part_stats(conn, "sheet", main_columns),
+    }
+    try:
+        join_table_columns = conn.execute(text("SHOW COLUMNS FROM `sheet1`")).fetchall()
+        duplicate_stats["sheet1"] = build_duplicate_part_stats(conn, "sheet1", [col[0] for col in join_table_columns])
+    except Exception:
+        duplicate_stats["sheet1"] = {
+            "duplicate_part_count": 0,
+            "duplicate_row_count": 0,
+            "samples": [],
+        }
 
     return {
         "row_count": len(rows),
@@ -437,13 +522,17 @@ def build_unfinished_select_result(conn, resolved_target_date: date, matched_com
             "unfinished_count": unfinished_count,
             "due_planned_count": due_planned_count,
             "due_completed_count": due_completed_count,
+            "delete_row_count": delete_row_count,
             "delete_completed_count": delete_completed_count,
+            "delete_unfinished_excluded_count": delete_unfinished_excluded_count,
             "matched_completed_count": matched_completed_count,
             "unfinished_by_difference": max(due_planned_count - due_completed_count, 0),
             "target_date": resolved_target_date.isoformat(),
-            "formula": "ESO Plan Date <= 统计日期，且 ESO Actual Date 为空 = 未完成数量",
+            "formula": "ESO Plan Date <= 统计日期，ESO Actual Date 为空，且操作类型不是 D = 未完成数量",
+            "group_field": group_col or "功能组",
         },
         "group_stats": group_rows,
+        "duplicate_stats": duplicate_stats,
     }
 
 def find_column_by_sanitized_header(ws, header_row: int, expected_name: str):
@@ -563,6 +652,225 @@ def append_dataframe_to_table(table_name: str, df: pd.DataFrame):
     records = df.to_dict(orient="records")
     with engine.begin() as conn:
         conn.execute(table.insert(), records)
+
+def deduplicate_columns(columns: List[str]) -> List[str]:
+    seen = set()
+    new_cols = []
+    for col in columns:
+        suffix = 1
+        orig = col
+        while col in seen:
+            col = f"{orig}_{suffix}"
+            suffix += 1
+        seen.add(col)
+        new_cols.append(col)
+    return new_cols
+
+def read_excel_with_header_candidates(file_bytes: bytes, header_candidates=(1, 0)) -> pd.DataFrame:
+    """图纸模板还未固化，优先按零件俱乐部第二行表头读取，失败再退回第一行。"""
+    last_df = None
+    for header in header_candidates:
+        excel_file = io.BytesIO(file_bytes)
+        df = pd.read_excel(excel_file, sheet_name=0, header=header)
+        if df.empty:
+            last_df = df
+            continue
+        df.columns = deduplicate_columns([sanitize_name(col, is_column=True) for col in df.columns])
+        if '零件号' in df.columns:
+            return df
+        last_df = df
+    return last_df if last_df is not None else pd.DataFrame()
+
+def find_first_existing_column(columns: List[str], aliases: List[str]):
+    alias_set = {sanitize_name(alias, is_column=True) for alias in aliases}
+    for col in columns:
+        if col in alias_set:
+            return col
+
+    lowered_aliases = [sanitize_name(alias, is_column=True).lower() for alias in aliases]
+    for col in columns:
+        lowered_col = col.lower()
+        if any(alias and alias in lowered_col for alias in lowered_aliases):
+            return col
+    return None
+
+def parse_date_to_date(value):
+    parsed = parse_date_like_value(value)
+    if isinstance(parsed, datetime):
+        return parsed.date()
+    if isinstance(parsed, date):
+        return parsed
+    return None
+
+def add_one_month(value: date) -> date:
+    return (pd.Timestamp(value) + pd.DateOffset(months=1)).date()
+
+DRAWING_COLUMN_ALIASES = {
+    "part_no": ["零件号", "Part_No", "Part_Number", "Part Number"],
+    "operation": ["操作类型"],
+    "group": ["部门", "功能组", "专业组"],
+    "engineer": ["工程师", "设计工程师", "负责人"],
+    "model_plan": ["数模计划日期", "数模_Plan_Date", "数模PlanDate", "TG2_Plan_Date"],
+    "model_actual": ["数模实际日期", "数模发布日期", "数模_Actual_Date", "数模ActualDate", "TG2_Actual_Date"],
+    "drawing_plan": ["图纸计划日期", "图纸_Plan_Date", "图纸PlanDate", "2D_Drawing_Plan_Date"],
+    "drawing_actual": ["图纸实际日期", "图纸发布日期", "图纸发布实际日期", "图纸_Actual_Date", "2D_Drawing_Actual_Date"],
+    "drawing_no": ["图纸号", "2D_Drawing_No.", "2D_Drawing_No_", "t_2D_Drawing_No_"],
+}
+
+def detect_drawing_columns(columns: List[str]):
+    return {
+        key: find_first_existing_column(columns, aliases)
+        for key, aliases in DRAWING_COLUMN_ALIASES.items()
+    }
+
+def build_drawing_actual_map(file_bytes: bytes):
+    if not file_bytes:
+        return {}
+
+    df = read_excel_with_header_candidates(file_bytes, header_candidates=(0, 1))
+    if df.empty:
+        return {}
+
+    columns = df.columns.tolist()
+    detected = detect_drawing_columns(columns)
+    part_col = detected.get("part_no")
+    actual_col = detected.get("drawing_actual") or find_first_existing_column(columns, ["归档日期", "发布日期", "发布时间"])
+    if not part_col or not actual_col:
+        return {}
+
+    actual_map = {}
+    for _, row in df.iterrows():
+        part_no = normalize_part_no(row.get(part_col))
+        actual_value = row.get(actual_col)
+        if part_no and is_effective_value(actual_value):
+            actual_map[part_no] = actual_value
+    return actual_map
+
+def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes: bytes | None, resolved_target_date: date):
+    df = read_excel_with_header_candidates(club_file_bytes)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="图纸零件俱乐部文件为空或无法读取")
+
+    detected = detect_drawing_columns(df.columns.tolist())
+    part_col = detected.get("part_no")
+    model_plan_col = detected.get("model_plan")
+    model_actual_col = detected.get("model_actual")
+    drawing_actual_col = detected.get("drawing_actual")
+
+    missing = []
+    if not part_col:
+        missing.append("零件号")
+    if not model_plan_col:
+        missing.append("数模计划日期/TG2 Plan Date")
+    if not model_actual_col:
+        missing.append("数模实际日期/TG2 Actual Date")
+    if not drawing_actual_col and not published_file_bytes:
+        missing.append("图纸实际发布日期/第二个图纸发布清单")
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"图纸模板缺少必要字段: {', '.join(missing)}",
+                "detected_columns": detected,
+                "available_columns": df.columns.tolist(),
+            },
+        )
+
+    type_mapping = {col: String(255) for col in df.columns}
+    df = preprocess_data(df, type_mapping)
+    published_actual_map = build_drawing_actual_map(published_file_bytes) if published_file_bytes else {}
+    rows = []
+    delete_excluded_count = 0
+
+    operation_col = detected.get("operation")
+    group_col = detected.get("group")
+    engineer_col = detected.get("engineer")
+    drawing_plan_col = detected.get("drawing_plan")
+    drawing_no_col = detected.get("drawing_no")
+
+    for _, row in df.iterrows():
+        operation_value = str(row.get(operation_col, "") or "").strip().upper() if operation_col else ""
+        if operation_value == "D":
+            delete_excluded_count += 1
+            continue
+
+        part_no = normalize_part_no(row.get(part_col))
+        if not part_no:
+            continue
+
+        model_plan_date = parse_date_to_date(row.get(model_plan_col))
+        model_actual_date = parse_date_to_date(row.get(model_actual_col))
+        drawing_plan_date = parse_date_to_date(row.get(drawing_plan_col)) if drawing_plan_col else None
+        drawing_actual_value = row.get(drawing_actual_col) if drawing_actual_col else None
+        if not is_effective_value(drawing_actual_value):
+            drawing_actual_value = published_actual_map.get(part_no)
+        drawing_actual_date = parse_date_to_date(drawing_actual_value)
+
+        base_row = row.to_dict()
+        base_row.update({
+            "零件号": part_no,
+            "功能组": row.get(group_col, "") if group_col else "",
+            "工程师": row.get(engineer_col, "") if engineer_col else "",
+            "图纸号": row.get(drawing_no_col, "") if drawing_no_col else "",
+            "图纸实际日期": drawing_actual_date.isoformat() if drawing_actual_date else "",
+        })
+
+        if model_plan_date and model_plan_date <= resolved_target_date and not model_actual_date:
+            rows.append({
+                **base_row,
+                "未完成类型": "数模未完成",
+                "数模状态": "计划已到期未完成",
+                "图纸状态": "待数模完成后一个月内发布",
+                "图纸要求完成日期": "",
+            })
+            rows.append({
+                **base_row,
+                "未完成类型": "图纸未发布",
+                "数模状态": "数模未完成",
+                "图纸状态": "受数模未完成影响",
+                "图纸要求完成日期": "待数模完成后一个月",
+            })
+            continue
+
+        drawing_due_date = None
+        if model_actual_date:
+            drawing_due_date = add_one_month(model_actual_date)
+        elif drawing_plan_date:
+            drawing_due_date = drawing_plan_date
+
+        if drawing_due_date and drawing_due_date <= resolved_target_date and not drawing_actual_date:
+            rows.append({
+                **base_row,
+                "未完成类型": "图纸未发布",
+                "数模状态": "数模已完成" if model_actual_date else "按图纸计划日期判断",
+                "图纸状态": "到期未发布",
+                "图纸要求完成日期": drawing_due_date.isoformat() if isinstance(drawing_due_date, date) else str(drawing_due_date),
+            })
+
+    group_counter: Dict[str, int] = {}
+    type_counter: Dict[str, int] = {}
+    for row in rows:
+        group_name = str(row.get("功能组") or "未知功能组")
+        type_name = str(row.get("未完成类型") or "未知类型")
+        group_counter[group_name] = group_counter.get(group_name, 0) + 1
+        type_counter[type_name] = type_counter.get(type_name, 0) + 1
+
+    group_stats = [{"功能组": key, "count": value} for key, value in sorted(group_counter.items(), key=lambda item: item[1], reverse=True)]
+    type_stats = [{"未完成类型": key, "count": value} for key, value in sorted(type_counter.items(), key=lambda item: item[1], reverse=True)]
+
+    return {
+        "row_count": len(rows),
+        "data": rows,
+        "group_stats": group_stats,
+        "type_stats": type_stats,
+        "summary": {
+            "target_date": resolved_target_date.isoformat(),
+            "unfinished_count": len(rows),
+            "delete_excluded_count": delete_excluded_count,
+            "formula": "数模计划日期 <= 统计日期且数模未完成，或数模完成后一个月内图纸未发布；操作类型 D 不进入未完成清单",
+            "detected_columns": detected,
+        },
+    }
 
 @app.post("/upload-excel/", summary="上传Excel文件")
 async def upload_excel(file: UploadFile = File(...)):
@@ -1099,10 +1407,15 @@ async def upload_two_excel(
                     # SQL 1: 更新非空归档日期到ESO Actual Date - 使用固定SQL
                     update_sql = """
                     UPDATE sheet
-                    JOIN sheet1 ON sheet.零件号 = sheet1.零件号
-                    SET sheet.ESO_Actual_Date = sheet1.归档日期
-                    WHERE sheet1.归档日期 IS NOT NULL
-                      AND TRIM(sheet1.归档日期) != ''
+                    JOIN (
+                        SELECT 零件号, MAX(归档日期) AS 归档日期
+                        FROM sheet1
+                        WHERE 归档日期 IS NOT NULL AND TRIM(归档日期) != ''
+                        GROUP BY 零件号
+                    ) archived_sheet1 ON sheet.零件号 = archived_sheet1.零件号
+                    SET sheet.ESO_Actual_Date = archived_sheet1.归档日期
+                    WHERE archived_sheet1.归档日期 IS NOT NULL
+                      AND TRIM(archived_sheet1.归档日期) != ''
                       AND (sheet.操作类型 IS NULL OR UPPER(TRIM(sheet.操作类型)) != 'D');
                     """
                     
@@ -1177,6 +1490,41 @@ async def regenerate_unfinished_list(target_date: str = Body(None, embed=True)):
     except Exception as e:
         logger.error(f"重新生成未完成清单失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"重新生成未完成清单失败: {str(e)}")
+
+@app.post("/upload-drawing-excel/", summary="上传图纸相关Excel并生成未完成清单")
+async def upload_drawing_excel(
+    club_file: UploadFile = File(...),
+    published_file: UploadFile | None = File(None),
+    target_date: str = Form(None),
+):
+    """
+    图纸场景独立入口。
+
+    - 第一份文件：零件俱乐部或包含数模/图纸计划与实际日期的主清单
+    - 第二份文件：可选，图纸发布/归档清单，用于补充图纸实际发布日期
+    - 当前按会议规则生成初版：操作类型 D 不进入未完成清单；数模未完成时数模和图纸都入未完成；数模完成后一个月内图纸未发布则入未完成
+    """
+    if not club_file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx 或 .xls 文件 (club_file)")
+    if published_file and not published_file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx 或 .xls 文件 (published_file)")
+
+    try:
+        resolved_target_date = resolve_target_date(target_date)
+        club_contents = await club_file.read()
+        published_contents = await published_file.read() if published_file else None
+        result = build_drawing_unfinished_result(club_contents, published_contents, resolved_target_date)
+        return {
+            "club_file": club_file.filename,
+            "published_file": published_file.filename if published_file else None,
+            "target_date": resolved_target_date.isoformat(),
+            "select_result": result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"图纸未完成清单生成失败: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"图纸未完成清单生成失败: {str(e)}")
 
 @app.get("/download/{filename}", summary="下载生成的Excel文件")
 async def download_generated_file(filename: str):

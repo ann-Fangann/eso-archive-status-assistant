@@ -130,10 +130,33 @@
             <el-descriptions-item label="有实际完成日期数量">{{ summary.completed_count }}</el-descriptions-item>
             <el-descriptions-item label="未完成数量">{{ summary.unfinished_count }}</el-descriptions-item>
             <el-descriptions-item label="Delete行已有实际日期数量">{{ summary.delete_completed_count }}</el-descriptions-item>
+            <el-descriptions-item label="Delete行排除未完成数量">{{ summary.delete_unfinished_excluded_count || 0 }}</el-descriptions-item>
             <el-descriptions-item label="本次回填数量">{{ summary.matched_completed_count }}</el-descriptions-item>
             <el-descriptions-item label="截至日期已完成数量">{{ summary.due_completed_count }}</el-descriptions-item>
             <el-descriptions-item label="统计口径" :span="2">{{ summary.formula }}</el-descriptions-item>
           </el-descriptions>
+
+          <el-alert
+            v-if="duplicateWarningText"
+            :title="duplicateWarningText"
+            type="warning"
+            show-icon
+            :closable="false"
+            style="margin-top: 12px;"
+          />
+
+          <div class="report-panel">
+            <div class="section-header">
+              <h4>邮件汇报文本</h4>
+              <el-button size="small" plain @click="copyReportText">复制文本</el-button>
+            </div>
+            <el-input
+              :model-value="reportText"
+              type="textarea"
+              :autosize="{ minRows: 4, maxRows: 8 }"
+              readonly
+            />
+          </div>
         </div>
 
         <div v-if="unfinishedList.length" style="margin-top: 20px;">
@@ -286,6 +309,34 @@ const resultTableData = computed(() => {
 
 const summary = computed(() => uploadResult.value?.sql_results?.select_result?.summary || null)
 const unfinishedList = computed(() => uploadResult.value?.sql_results?.select_result?.data || [])
+const groupStats = computed(() => uploadResult.value?.sql_results?.select_result?.group_stats || [])
+const duplicateStats = computed(() => uploadResult.value?.sql_results?.select_result?.duplicate_stats || null)
+
+const duplicateWarningText = computed(() => {
+  const sheetDuplicateCount = duplicateStats.value?.sheet?.duplicate_part_count || 0
+  const archiveDuplicateCount = duplicateStats.value?.sheet1?.duplicate_part_count || 0
+  const warnings = []
+  if (sheetDuplicateCount) warnings.push(`零件俱乐部存在 ${sheetDuplicateCount} 个重复零件号`)
+  if (archiveDuplicateCount) warnings.push(`ESO零件清单存在 ${archiveDuplicateCount} 个重复零件号，回填时按同一零件号的最大归档日期处理`)
+  return warnings.join('；')
+})
+
+const reportText = computed(() => {
+  if (!summary.value) return ''
+
+  const topGroups = groupStats.value
+    .slice(0, 5)
+    .map((item: any) => `${item['功能组'] || '未知功能组'} ${item.count || 0} 项`)
+    .join('，')
+  const excludedDeleteCount = summary.value.delete_unfinished_excluded_count || 0
+  const matchedCount = summary.value.matched_completed_count ?? 0
+
+  return [
+    `截至 ${summary.value.target_date}，ESO应完成计划 ${summary.value.due_planned_count || 0} 项，已完成 ${summary.value.due_completed_count || 0} 项，未完成 ${summary.value.unfinished_count || 0} 项。`,
+    `本次根据ESO零件清单回填实际归档日期 ${matchedCount} 项；未完成统计已排除操作类型为 D 的记录${excludedDeleteCount ? `，本次排除 ${excludedDeleteCount} 项` : ''}。`,
+    topGroups ? `未完成主要分布：${topGroups}。` : '当前统计日期没有未完成项。',
+  ].join('\n')
+})
 
 const columnLabelMap: Record<string, string> = {
   'ESO备注_类型': 'ESO备注',
@@ -578,9 +629,73 @@ const downloadFile = (downloadUrl: string) => {
   window.open(`/api${downloadUrl}`, '_blank')
 }
 
+const copyReportText = async () => {
+  if (!reportText.value) {
+    ElMessage.warning('暂无可复制的汇报文本')
+    return
+  }
+
+  try {
+    await navigator.clipboard.writeText(reportText.value)
+    ElMessage.success('汇报文本已复制')
+  } catch (error) {
+    console.error('复制汇报文本失败:', error)
+    ElMessage.warning('复制失败，请手动选择文本复制')
+  }
+}
+
 const getExportDateString = () => {
   const dateValue = summary.value?.target_date || targetDate.value || getYesterday()
   return String(dateValue).replace(/-/g, '')
+}
+
+const styleWorksheet = (ws: XLSX.WorkSheet, headerColor = '4472C4') => {
+  const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null
+  if (!range) return
+
+  for (let row = range.s.r; row <= range.e.r; row++) {
+    for (let col = range.s.c; col <= range.e.c; col++) {
+      const address = XLSX.utils.encode_cell({ r: row, c: col })
+      const cell = ws[address]
+      if (!cell) continue
+
+      const isHeader = row === 0
+      const isBlankBodyCell = !isHeader && (cell.v === undefined || cell.v === null || cell.v === '')
+      if (isBlankBodyCell) continue
+
+      cell.s = {
+        border: {
+          top: { style: 'thin', color: { rgb: 'D9E2F3' } },
+          bottom: { style: 'thin', color: { rgb: 'D9E2F3' } },
+          left: { style: 'thin', color: { rgb: 'D9E2F3' } },
+          right: { style: 'thin', color: { rgb: 'D9E2F3' } }
+        },
+        alignment: {
+          vertical: 'center',
+          wrapText: true
+        }
+      }
+
+      if (isHeader) {
+        cell.s.fill = { fgColor: { rgb: headerColor } }
+        cell.s.font = { color: { rgb: 'FFFFFF' }, bold: true }
+      }
+    }
+  }
+}
+
+const appendJsonSheet = (
+  wb: XLSX.WorkBook,
+  rows: Record<string, any>[],
+  sheetName: string,
+  widths: number[] = []
+) => {
+  const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{}])
+  styleWorksheet(ws)
+  if (widths.length) {
+    ws['!cols'] = widths.map(wch => ({ wch }))
+  }
+  XLSX.utils.book_append_sheet(wb, ws, sheetName)
 }
 
 const exportUnfinishedList = () => {
@@ -605,42 +720,48 @@ const exportUnfinishedList = () => {
 
   const wb = XLSX.utils.book_new()
   const ws = XLSX.utils.json_to_sheet(exportRows)
-  const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null
-
-  if (range) {
-    for (let row = range.s.r; row <= range.e.r; row++) {
-      for (let col = range.s.c; col <= range.e.c; col++) {
-        const address = XLSX.utils.encode_cell({ r: row, c: col })
-        const cell = ws[address]
-        if (!cell) continue
-
-        const isHeader = row === 0
-        const isBlankBodyCell = !isHeader && (cell.v === undefined || cell.v === null || cell.v === '')
-        if (isBlankBodyCell) continue
-
-        cell.s = {
-          border: {
-            top: { style: 'thin', color: { rgb: 'D9E2F3' } },
-            bottom: { style: 'thin', color: { rgb: 'D9E2F3' } },
-            left: { style: 'thin', color: { rgb: 'D9E2F3' } },
-            right: { style: 'thin', color: { rgb: 'D9E2F3' } }
-          },
-          alignment: {
-            vertical: 'center',
-            wrapText: true
-          }
-        }
-
-        if (isHeader) {
-          cell.s.fill = { fgColor: { rgb: '4472C4' } }
-          cell.s.font = { color: { rgb: 'FFFFFF' }, bold: true }
-        }
-      }
-    }
-  }
-
+  styleWorksheet(ws)
   ws['!cols'] = selectedDefs.map(col => ({ wch: Math.min(Math.max(Math.round((col.width || 120) / 8), 12), 28) }))
   XLSX.utils.book_append_sheet(wb, ws, '延期未发布ESO零件')
+
+  const summaryRows = summary.value ? [
+    { 指标: '统计日期', 数值: summary.value.target_date || '' },
+    { 指标: '有计划日期数量', 数值: summary.value.planned_count || 0 },
+    { 指标: '截至统计日期计划数量', 数值: summary.value.due_planned_count || 0 },
+    { 指标: '有实际完成日期数量', 数值: summary.value.completed_count || 0 },
+    { 指标: '截至日期已完成数量', 数值: summary.value.due_completed_count || 0 },
+    { 指标: '未完成数量', 数值: summary.value.unfinished_count || 0 },
+    { 指标: '本次回填数量', 数值: summary.value.matched_completed_count ?? 0 },
+    { 指标: 'Delete行已有实际日期数量', 数值: summary.value.delete_completed_count || 0 },
+    { 指标: 'Delete行排除未完成数量', 数值: summary.value.delete_unfinished_excluded_count || 0 },
+    { 指标: '统计口径', 数值: summary.value.formula || '' },
+  ] : []
+  appendJsonSheet(wb, summaryRows, '汇总结果', [24, 80])
+
+  const statField = summary.value?.group_field || '功能组'
+  const statRows = groupStats.value.map((item: any) => ({
+    统计维度: statField,
+    名称: item['功能组'] || '未知功能组',
+    未完成数量: item.count || 0
+  }))
+  appendJsonSheet(wb, statRows, '部门统计', [16, 32, 14])
+
+  const duplicateRows = [
+    ...(duplicateStats.value?.sheet?.samples || []).map((item: any) => ({
+      来源: '零件俱乐部',
+      零件号: item['零件号'],
+      重复次数: item.count
+    })),
+    ...(duplicateStats.value?.sheet1?.samples || []).map((item: any) => ({
+      来源: 'ESO零件清单',
+      零件号: item['零件号'],
+      重复次数: item.count
+    })),
+  ]
+  if (duplicateRows.length) {
+    appendJsonSheet(wb, duplicateRows, '重复零件号', [18, 28, 12])
+  }
+
   XLSX.writeFile(wb, `延期未发布ESO零件-${getExportDateString()}.xlsx`)
   ElMessage.success('未完成清单已导出')
 }
@@ -1013,6 +1134,14 @@ onUnmounted(() => {
   gap: 10px;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.report-panel {
+  margin-top: 16px;
+}
+
+.report-panel h4 {
+  margin: 0;
 }
 
 .column-options {
