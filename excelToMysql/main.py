@@ -492,22 +492,24 @@ def create_modified_club_workbook(file_bytes: bytes, archive_map: Dict, original
         raise ValueError("零件俱乐部清单缺少必要列：零件号或 ESO Actual Date")
 
     filled_count = 0
-    delete_filled_count = 0
+    delete_skipped_count = 0
     for row in range(header_row + 1, ws.max_row + 1):
         part_no = normalize_part_no(ws.cell(row=row, column=part_col).value)
         archive_info = archive_map.get(part_no)
         if not archive_info:
             continue
 
+        operation_value = ""
+        if operation_col:
+            operation_value = str(ws.cell(row=row, column=operation_col).value or "").strip().upper()
+        if operation_value == "D":
+            delete_skipped_count += 1
+            continue
+
         actual_cell = ws.cell(row=row, column=actual_col)
         actual_cell.value = parse_date_like_value(archive_info["value"])
         actual_cell.number_format = "yyyy/mm/dd"
         filled_count += 1
-
-        if operation_col:
-            operation_value = str(ws.cell(row=row, column=operation_col).value or "").strip().upper()
-            if operation_value == "D":
-                delete_filled_count += 1
 
     safe_stem = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", Path(original_filename).stem)
     output_name = f"{safe_stem}-已回填ESO实际归档日期-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}.xlsx"
@@ -518,7 +520,7 @@ def create_modified_club_workbook(file_bytes: bytes, archive_map: Dict, original
         "filename": output_name,
         "download_url": f"/download/{output_name}",
         "filled_count": filled_count,
-        "delete_filled_count": delete_filled_count,
+        "delete_skipped_count": delete_skipped_count,
     }
 
 def split_dataframe_for_tables(df, table_names, max_cols_per_table=49):  # 保留1列给ID
@@ -550,6 +552,17 @@ def split_dataframe_for_tables(df, table_names, max_cols_per_table=49):  # 保�
         part_num += 1
     
     return dataframes_parts
+
+def append_dataframe_to_table(table_name: str, df: pd.DataFrame):
+    """使用 SQLAlchemy 原生批量插入，避免 pandas.to_sql 在不同服务器版本下不兼容。"""
+    if df.empty:
+        return
+
+    metadata = MetaData()
+    table = Table(table_name, metadata, autoload_with=engine)
+    records = df.to_dict(orient="records")
+    with engine.begin() as conn:
+        conn.execute(table.insert(), records)
 
 @app.post("/upload-excel/", summary="上传Excel文件")
 async def upload_excel(file: UploadFile = File(...)):
@@ -666,7 +679,7 @@ async def upload_excel(file: UploadFile = File(...)):
                     
                     logger.info(f"正在插入批次 {start_idx//batch_size + 1}/{(total_rows-1)//batch_size + 1} 到表 {t_name}")
                     
-                    batch_df.to_sql(t_name, con=engine, if_exists='append', index=False, method='multi', dtype=current_type_mapping)
+                    append_dataframe_to_table(t_name, batch_df)
                 
                 logger.info(f"成功插入 {len(t_df)} 行数据到表 {t_name}")
 
@@ -886,7 +899,7 @@ async def upload_two_excel(
                 
                 logger.info(f"正在插入批次 {start_idx//batch_size + 1}/{(total_rows-1)//batch_size + 1} 到表 {table_name}")
                 
-                batch_df.to_sql(table_name, con=engine, if_exists='append', index=False, method='multi', dtype=current_type_mapping)
+                append_dataframe_to_table(table_name, batch_df)
             
             results1[sheet_name] = f"成功导入 {len(df)} 行数据到表 `{table_name}`"
             logger.info(f"成功插入数据到表: {table_name}")
@@ -906,10 +919,10 @@ async def upload_two_excel(
             archive_map = build_archive_date_map(contents2)
             modified_workbook = create_modified_club_workbook(contents1, archive_map, file1.filename)
             logger.info(
-                "已生成回填后的零件俱乐部文件: %s，回填 %s 行，其中 Delete 行 %s 行",
+                "已生成回填后的零件俱乐部文件: %s，回填 %s 行，跳过 Delete 行 %s 行",
                 modified_workbook["filename"],
                 modified_workbook["filled_count"],
-                modified_workbook["delete_filled_count"],
+                modified_workbook["delete_skipped_count"],
             )
         except Exception as workbook_error:
             logger.error(f"生成回填后的零件俱乐部文件失败: {str(workbook_error)}", exc_info=True)
@@ -1022,7 +1035,7 @@ async def upload_two_excel(
                 
                 logger.info(f"正在插入批次 {start_idx//batch_size + 1}/{(total_rows-1)//batch_size + 1} 到表 {table_name}")
                 
-                batch_df.to_sql(table_name, con=engine, if_exists='append', index=False, method='multi', dtype=current_type_mapping)
+                append_dataframe_to_table(table_name, batch_df)
             
             results2[sheet_name] = f"成功导入 {len(df)} 行数据到表 `{table_name}`"
             logger.info(f"成功插入数据到表: {table_name}")
@@ -1088,7 +1101,9 @@ async def upload_two_excel(
                     UPDATE sheet
                     JOIN sheet1 ON sheet.零件号 = sheet1.零件号
                     SET sheet.ESO_Actual_Date = sheet1.归档日期
-                    WHERE sheet1.归档日期 IS NOT NULL AND TRIM(sheet1.归档日期) != '';
+                    WHERE sheet1.归档日期 IS NOT NULL
+                      AND TRIM(sheet1.归档日期) != ''
+                      AND (sheet.操作类型 IS NULL OR UPPER(TRIM(sheet.操作类型)) != 'D');
                     """
                     
                     try:

@@ -129,7 +129,7 @@
             <el-descriptions-item label="截至统计日期计划数量">{{ summary.due_planned_count }}</el-descriptions-item>
             <el-descriptions-item label="有实际完成日期数量">{{ summary.completed_count }}</el-descriptions-item>
             <el-descriptions-item label="未完成数量">{{ summary.unfinished_count }}</el-descriptions-item>
-            <el-descriptions-item label="Delete行已回填数量">{{ summary.delete_completed_count }}</el-descriptions-item>
+            <el-descriptions-item label="Delete行已有实际日期数量">{{ summary.delete_completed_count }}</el-descriptions-item>
             <el-descriptions-item label="本次回填数量">{{ summary.matched_completed_count }}</el-descriptions-item>
             <el-descriptions-item label="截至日期已完成数量">{{ summary.due_completed_count }}</el-descriptions-item>
             <el-descriptions-item label="统计口径" :span="2">{{ summary.formula }}</el-descriptions-item>
@@ -139,17 +139,60 @@
         <div v-if="unfinishedList.length" style="margin-top: 20px;">
           <div class="section-header">
             <h3>未完成清单</h3>
-            <span>共 {{ unfinishedList.length }} 条</span>
+            <div class="section-actions">
+              <span>共 {{ unfinishedList.length }} 条</span>
+              <el-popover
+                placement="bottom"
+                title="选择显示和导出的列"
+                width="320"
+                trigger="click"
+              >
+                <div class="column-options">
+                  <el-checkbox
+                    :model-value="isAllUnfinishedColumnsSelected"
+                    :indeterminate="isSomeUnfinishedColumnsSelected"
+                    @change="toggleUnfinishedColumns"
+                  >
+                    全选/全不选
+                  </el-checkbox>
+                  <el-checkbox-group
+                    v-model="selectedUnfinishedColumns"
+                    class="column-checkbox-group"
+                    @change="saveUnfinishedColumnSelection"
+                  >
+                    <el-checkbox
+                      v-for="col in allUnfinishedColumns"
+                      :key="col.prop"
+                      :label="col.prop"
+                      class="column-checkbox"
+                    >
+                      {{ col.label }}
+                    </el-checkbox>
+                  </el-checkbox-group>
+                </div>
+                <template #reference>
+                  <el-button size="small" plain>选择列</el-button>
+                </template>
+              </el-popover>
+              <el-button
+                size="small"
+                type="primary"
+                :disabled="!selectedUnfinishedColumns.length"
+                @click="exportUnfinishedList"
+              >
+                导出未完成清单
+              </el-button>
+            </div>
           </div>
-          <el-table :data="unfinishedList" style="width: 100%" stripe max-height="420">
-            <el-table-column prop="零件号" label="零件号" min-width="130" />
-            <el-table-column prop="操作类型" label="操作类型" width="90" />
-            <el-table-column prop="功能组" label="功能组" width="120" />
-            <el-table-column prop="工程师" label="工程师" min-width="160" />
-            <el-table-column prop="ESO_Plan_Date" label="ESO Plan Date" min-width="130" />
-            <el-table-column prop="ESO_Actual_Date" label="ESO Actual Date" min-width="140" />
-            <el-table-column prop="ESO备注_类型" label="ESO备注" min-width="130" />
-            <el-table-column prop="是否需要ESO_物流提供_" label="是否需要ESO" min-width="120" />
+          <el-table :data="unfinishedDisplayRows" style="width: 100%" stripe max-height="420">
+            <el-table-column
+              v-for="col in selectedUnfinishedColumnDefs"
+              :key="col.prop"
+              :prop="col.prop"
+              :label="col.label"
+              :min-width="col.width"
+              show-overflow-tooltip
+            />
           </el-table>
         </div>
         
@@ -197,8 +240,8 @@
           </div>
           
           <!-- 如果图表数据未准备好，显示提示信息 -->
-          <div v-if="uploadResult.sql_results.select_result && uploadResult.sql_results.select_result.data && !chartDataReady" style="margin-top: 20px; color: #f56c6c;">
-            <p>图表数据处理失败，请检查控制台日志或联系管理员。</p>
+          <div v-if="uploadResult.sql_results.select_result && uploadResult.sql_results.select_result.error" style="margin-top: 20px; color: #f56c6c;">
+            <p>{{ uploadResult.sql_results.select_result.error }}</p>
           </div>
         </div>
       </div>
@@ -207,11 +250,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onUnmounted, watch } from 'vue'
 import axios from 'axios'
 import { UploadFilled } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import * as echarts from 'echarts'
+import * as XLSX from 'xlsx-js-style'
 
 const file1 = ref<File | null>(null)
 const file2 = ref<File | null>(null)
@@ -242,6 +287,112 @@ const resultTableData = computed(() => {
 const summary = computed(() => uploadResult.value?.sql_results?.select_result?.summary || null)
 const unfinishedList = computed(() => uploadResult.value?.sql_results?.select_result?.data || [])
 
+const columnLabelMap: Record<string, string> = {
+  'ESO备注_类型': 'ESO备注',
+  '首次申请项目': '首次申请项目',
+  'ESO_Plan_Date': 'ESO Plan Date',
+  'ESO_Actual_Date': 'ESO Actual Date',
+  '是否需要ESO_物流提供_': '是否需要ESO',
+  't_2D_Drawing_No_': '2D Drawing No.',
+  'ESO状态': 'ESO状态'
+}
+
+const preferredUnfinishedColumns = [
+  '操作类型',
+  '层级',
+  '数据类型',
+  '产品',
+  '车型年',
+  '零件号',
+  '短SVPPS',
+  'FFC',
+  'FFC中文描述',
+  '状态',
+  '工程采购级别',
+  '左右件',
+  '功能组',
+  '工程师代码',
+  '工程师',
+  '工厂编号',
+  '节点组',
+  '本色件标识',
+  'TG2_Plan_Date',
+  'TG2_Actual_Date',
+  '2D_Drawing_Actual_Date',
+  't_2D_Drawing_No_',
+  'ESO_Plan_Date',
+  'ESO材料送检计划',
+  'ESO备注_类型',
+  '是否需要ESO_物流提供_',
+  'ESO_Actual_Date',
+  '备注',
+  '首次申请项目',
+  'ESO状态'
+]
+
+const defaultUnfinishedColumns = [
+  '操作类型',
+  '产品',
+  '车型年',
+  '零件号',
+  '功能组',
+  '工程师',
+  'ESO_Plan_Date',
+  'ESO_Actual_Date',
+  'ESO备注_类型',
+  '首次申请项目',
+  'ESO状态'
+]
+
+const selectedUnfinishedColumns = ref<string[]>([])
+
+const withEsoStatus = (row: Record<string, any>) => ({
+  ...row,
+  ESO状态: '审批中'
+})
+
+const unfinishedDisplayRows = computed(() => unfinishedList.value.map((row: Record<string, any>) => withEsoStatus(row)))
+
+const getColumnLabel = (prop: string) => columnLabelMap[prop] || prop
+
+const getColumnWidth = (prop: string) => {
+  if (['零件号', '工程师', 'FFC中文描述', 'ESO备注_类型', '备注', '首次申请项目'].includes(prop)) return 160
+  if (prop.includes('Date') || prop.includes('日期')) return 140
+  if (['操作类型', '车型年', 'ESO状态'].includes(prop)) return 100
+  return 120
+}
+
+const allUnfinishedColumns = computed(() => {
+  const keySet = new Set<string>()
+  unfinishedDisplayRows.value.forEach((row: Record<string, any>) => {
+    Object.keys(row).forEach(key => keySet.add(key))
+  })
+
+  const orderedKeys = [
+    ...preferredUnfinishedColumns.filter(key => keySet.has(key)),
+    ...Array.from(keySet).filter(key => !preferredUnfinishedColumns.includes(key))
+  ]
+
+  return orderedKeys.map(prop => ({
+    prop,
+    label: getColumnLabel(prop),
+    width: getColumnWidth(prop)
+  }))
+})
+
+const selectedUnfinishedColumnDefs = computed(() => {
+  const selectedSet = new Set(selectedUnfinishedColumns.value)
+  return allUnfinishedColumns.value.filter(col => selectedSet.has(col.prop))
+})
+
+const isAllUnfinishedColumnsSelected = computed(() => {
+  return allUnfinishedColumns.value.length > 0 && selectedUnfinishedColumns.value.length === allUnfinishedColumns.value.length
+})
+
+const isSomeUnfinishedColumnsSelected = computed(() => {
+  return selectedUnfinishedColumns.value.length > 0 && selectedUnfinishedColumns.value.length < allUnfinishedColumns.value.length
+})
+
 const getYesterday = () => {
   const day = new Date()
   day.setDate(day.getDate() - 1)
@@ -252,6 +403,57 @@ const getYesterday = () => {
 }
 
 const targetDate = ref(getYesterday())
+
+const getSavedUnfinishedColumnSelection = () => {
+  try {
+    const saved = localStorage.getItem('eso_unfinished_columns')
+    return saved ? JSON.parse(saved) : []
+  } catch (error) {
+    console.error('读取未完成清单列选择失败:', error)
+    return []
+  }
+}
+
+const saveUnfinishedColumnSelection = () => {
+  localStorage.setItem('eso_unfinished_columns', JSON.stringify(selectedUnfinishedColumns.value))
+}
+
+const resetUnfinishedColumnSelection = () => {
+  const allKeys = allUnfinishedColumns.value.map(col => col.prop)
+  if (!allKeys.length) {
+    selectedUnfinishedColumns.value = []
+    return
+  }
+
+  const saved = getSavedUnfinishedColumnSelection().filter((key: string) => allKeys.includes(key))
+  const defaults = defaultUnfinishedColumns.filter(key => allKeys.includes(key))
+  selectedUnfinishedColumns.value = saved.length ? saved : defaults
+}
+
+const toggleUnfinishedColumns = (checked: boolean) => {
+  selectedUnfinishedColumns.value = checked ? allUnfinishedColumns.value.map(col => col.prop) : []
+  saveUnfinishedColumnSelection()
+}
+
+watch(allUnfinishedColumns, (columns) => {
+  const allKeys = columns.map(col => col.prop)
+  const validSelected = selectedUnfinishedColumns.value.filter(key => allKeys.includes(key))
+
+  if (!allKeys.length) {
+    selectedUnfinishedColumns.value = []
+    return
+  }
+
+  if (!validSelected.length) {
+    resetUnfinishedColumnSelection()
+    return
+  }
+
+  if (validSelected.length !== selectedUnfinishedColumns.value.length) {
+    selectedUnfinishedColumns.value = validSelected
+    saveUnfinishedColumnSelection()
+  }
+}, { immediate: true })
 
 const handleChange = (uploadFile: UploadFile, fileKey: string) => {
   if (fileKey === 'file1') {
@@ -376,6 +578,73 @@ const downloadFile = (downloadUrl: string) => {
   window.open(`/api${downloadUrl}`, '_blank')
 }
 
+const getExportDateString = () => {
+  const dateValue = summary.value?.target_date || targetDate.value || getYesterday()
+  return String(dateValue).replace(/-/g, '')
+}
+
+const exportUnfinishedList = () => {
+  if (!unfinishedDisplayRows.value.length) {
+    ElMessage.warning('当前没有可导出的未完成清单')
+    return
+  }
+
+  if (!selectedUnfinishedColumns.value.length) {
+    ElMessage.warning('请至少选择一列')
+    return
+  }
+
+  const selectedDefs = selectedUnfinishedColumnDefs.value
+  const exportRows = unfinishedDisplayRows.value.map((row: Record<string, any>) => {
+    const output: Record<string, any> = {}
+    selectedDefs.forEach(col => {
+      output[col.label] = row[col.prop] ?? ''
+    })
+    return output
+  })
+
+  const wb = XLSX.utils.book_new()
+  const ws = XLSX.utils.json_to_sheet(exportRows)
+  const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null
+
+  if (range) {
+    for (let row = range.s.r; row <= range.e.r; row++) {
+      for (let col = range.s.c; col <= range.e.c; col++) {
+        const address = XLSX.utils.encode_cell({ r: row, c: col })
+        const cell = ws[address]
+        if (!cell) continue
+
+        const isHeader = row === 0
+        const isBlankBodyCell = !isHeader && (cell.v === undefined || cell.v === null || cell.v === '')
+        if (isBlankBodyCell) continue
+
+        cell.s = {
+          border: {
+            top: { style: 'thin', color: { rgb: 'D9E2F3' } },
+            bottom: { style: 'thin', color: { rgb: 'D9E2F3' } },
+            left: { style: 'thin', color: { rgb: 'D9E2F3' } },
+            right: { style: 'thin', color: { rgb: 'D9E2F3' } }
+          },
+          alignment: {
+            vertical: 'center',
+            wrapText: true
+          }
+        }
+
+        if (isHeader) {
+          cell.s.fill = { fgColor: { rgb: '4472C4' } }
+          cell.s.font = { color: { rgb: 'FFFFFF' }, bold: true }
+        }
+      }
+    }
+  }
+
+  ws['!cols'] = selectedDefs.map(col => ({ wch: Math.min(Math.max(Math.round((col.width || 120) / 8), 12), 28) }))
+  XLSX.utils.book_append_sheet(wb, ws, '延期未发布ESO零件')
+  XLSX.writeFile(wb, `延期未发布ESO零件-${getExportDateString()}.xlsx`)
+  ElMessage.success('未完成清单已导出')
+}
+
 // 分析数据列信息
 const analyzeColumnInfo = (data: any[]) => {
   if (data.length === 0) return null
@@ -399,32 +668,23 @@ const analyzeColumnInfo = (data: any[]) => {
 }
 
 // 准备图表数据
-const prepareChartData = (data: any[], selectResult: any = null) => {
+const prepareChartData = async (data: any[] = [], selectResult: any = null) => {
   try {
-    // 如果数据为空，直接返回
-    if (!data || data.length === 0) {
-      console.log('数据为空，无法生成图表')
-      chartDataReady.value = false
-      return
-    }
+    data = data || []
     
     // 分析列信息
     columnInfo.value = analyzeColumnInfo(data)
-    
-    if (!columnInfo.value) {
-      console.log('无法分析数据列信息')
-      chartDataReady.value = false
-      return
-    }
+
+    const availableColumns = columnInfo.value?.availableColumns || []
     
     // 尝试找到功能组列名
-    const functionGroupCol = columnInfo.value.availableColumns.find((col: string) => 
+    const functionGroupCol = availableColumns.find((col: string) => 
       col.toLowerCase().includes('功能组') || col.toLowerCase().includes('function') || col.toLowerCase().includes('group')
     ) 
     console.log('功能组列名检测结果:', functionGroupCol)
     
     // 尝试找到ESO_Actual_Date列名
-    const esoActualDateCol = columnInfo.value.availableColumns.find((col: string) => 
+    const esoActualDateCol = availableColumns.find((col: string) => 
       col.toLowerCase().includes('actual') || col.toLowerCase().includes('date') || col.includes('ESO_Actual_Date')
     ) 
     console.log('ESO_Actual_Date列名检测结果:', esoActualDateCol)
@@ -500,28 +760,15 @@ const prepareChartData = (data: any[], selectResult: any = null) => {
     }).length
     
     const emptyCount = Number(selectResult?.summary?.unfinished_count ?? fallbackEmptyCount)
-    const nonEmptyCount = Number(selectResult?.summary?.completed_count ?? (data.length - fallbackEmptyCount))
+    const nonEmptyCount = Number(selectResult?.summary?.due_completed_count ?? selectResult?.summary?.completed_count ?? (data.length - fallbackEmptyCount))
 
     console.log('按功能组统计结果:', groupByFunction)
     console.log('空值数量:', emptyCount, '非空值数量:', nonEmptyCount)
-    
-    // 检查数据是否有效
-    if (Object.keys(groupByFunction).length === 0 && emptyCount === 0 && nonEmptyCount === 0) {
-      console.log('没有有效的数据用于生成图表')
-      chartDataReady.value = false
-      return
-    }
 
-    // 使用 nextTick 确保DOM元素渲染后再生成图表
-    nextTick(() => {
-      // 生成柱状图
-      generateBarChart(groupByFunction)
-      
-      // 生成饼图
-      generatePieChart(emptyCount, nonEmptyCount)
-      
-      chartDataReady.value = true
-    })
+    chartDataReady.value = true
+    await nextTick()
+    generateBarChart(groupByFunction)
+    generatePieChart(emptyCount, nonEmptyCount)
   } catch (error) {
     console.error('准备图表数据时出错:', error)
     message.value = '生成图表数据时出错: ' + (error as Error).message
@@ -532,99 +779,94 @@ const prepareChartData = (data: any[], selectResult: any = null) => {
 
 // 生成柱状图
 const generateBarChart = (data: Record<string, number>) => {
-  // 等待下一个tick以确保DOM元素已渲染
-  nextTick(() => {
-    if (!barChartRef.value) {
-      console.error('柱状图容器不存在', barChartRef.value)
-      return
-    }
+  if (!barChartRef.value) {
+    console.error('柱状图容器不存在', barChartRef.value)
+    return
+  }
     
-    // 销毁已存在的实例
-    const existingChart = echarts.getInstanceByDom(barChartRef.value)
-    if (existingChart) {
-      existingChart.dispose()
-    }
+  // 销毁已存在的实例
+  const existingChart = echarts.getInstanceByDom(barChartRef.value)
+  if (existingChart) {
+    existingChart.dispose()
+  }
     
-    // 初始化图表
-    const chart = echarts.init(barChartRef.value)
+  // 初始化图表
+  const chart = echarts.init(barChartRef.value)
     
-    // 如果没有数据，显示提示
-    if (Object.keys(data).length === 0) {
-      chart.setOption({
-        title: {
-          text: '没有可显示的数据',
-          left: 'center',
-          top: 'center',
-          textStyle: {
-            fontSize: 16
-          }
-        }
-      })
-      return
-    }
-    
-    const option = {
+  // 如果没有数据，显示提示
+  if (Object.keys(data).length === 0) {
+    chart.setOption({
       title: {
-        text: '各功能组未完成的数量',
-        left: 'center'
-      },
-      tooltip: {
-        trigger: 'axis',
-        axisPointer: {
-          type: 'shadow'
+        text: '该统计日期没有未完成项',
+        left: 'center',
+        top: 'center',
+        textStyle: {
+          fontSize: 16
         }
-      },
-      xAxis: {
-        type: 'category',
-        data: Object.keys(data),
-        axisLabel: {
-          interval: 0,
-          rotate: 45,
-          fontSize: 12
-        }
-      },
-      yAxis: {
-        type: 'value',
-        name: '数量'
-      },
-      series: [{
-        data: Object.values(data),
-        type: 'bar',
-        itemStyle: {
-          color: '#409eff'
-        }
-      }]
-    }
-    
-    chart.setOption(option)
-    
-    // 响应式调整
-    window.addEventListener('resize', () => {
-      if (barChartRef.value) {
-        const chart = echarts.getInstanceByDom(barChartRef.value)
-        if (chart) chart.resize()
       }
     })
+    return
+  }
+    
+  const option = {
+    title: {
+      text: '各功能组未完成的数量',
+      left: 'center'
+    },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: {
+        type: 'shadow'
+      }
+    },
+    xAxis: {
+      type: 'category',
+      data: Object.keys(data),
+      axisLabel: {
+        interval: 0,
+        rotate: 45,
+        fontSize: 12
+      }
+    },
+    yAxis: {
+      type: 'value',
+      name: '数量'
+    },
+    series: [{
+      data: Object.values(data),
+      type: 'bar',
+      itemStyle: {
+        color: '#409eff'
+      }
+    }]
+  }
+    
+  chart.setOption(option)
+    
+  // 响应式调整
+  window.addEventListener('resize', () => {
+    if (barChartRef.value) {
+      const chart = echarts.getInstanceByDom(barChartRef.value)
+      if (chart) chart.resize()
+    }
   })
 }
 
 // 生成饼图
 const generatePieChart = (emptyCount: number, nonEmptyCount: number) => {
-  // 等待下一个tick以确保DOM元素已渲染
-  nextTick(() => {
-    if (!pieChartRef.value) {
-      console.error('饼图容器不存在', pieChartRef.value)
-      return
-    }
+  if (!pieChartRef.value) {
+    console.error('饼图容器不存在', pieChartRef.value)
+    return
+  }
     
-    // 销毁已存在的实例
-    const existingChart = echarts.getInstanceByDom(pieChartRef.value)
-    if (existingChart) {
-      existingChart.dispose()
-    }
+  // 销毁已存在的实例
+  const existingChart = echarts.getInstanceByDom(pieChartRef.value)
+  if (existingChart) {
+    existingChart.dispose()
+  }
     
-    // 初始化图表
-    const chart = echarts.init(pieChartRef.value)
+  // 初始化图表
+  const chart = echarts.init(pieChartRef.value)
     
     // 如果没有数据，显示提示
     if (emptyCount === 0 && nonEmptyCount === 0) {
@@ -638,8 +880,8 @@ const generatePieChart = (emptyCount: number, nonEmptyCount: number) => {
           }
         }
       })
-      return
-    }
+    return
+  }
     
     const option = {
       title: {
@@ -684,15 +926,14 @@ const generatePieChart = (emptyCount: number, nonEmptyCount: number) => {
       ]
     }
     
-    chart.setOption(option)
+  chart.setOption(option)
     
-    // 响应式调整
-    window.addEventListener('resize', () => {
-      if (pieChartRef.value) {
-        const chart = echarts.getInstanceByDom(pieChartRef.value)
-        if (chart) chart.resize()
-      }
-    })
+  // 响应式调整
+  window.addEventListener('resize', () => {
+    if (pieChartRef.value) {
+      const chart = echarts.getInstanceByDom(pieChartRef.value)
+      if (chart) chart.resize()
+    }
   })
 }
 
@@ -764,6 +1005,30 @@ onUnmounted(() => {
 .section-header span {
   color: #606266;
   font-size: 14px;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.column-options {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.column-checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.column-checkbox {
+  margin-right: 0;
 }
 
 .upload-row {
