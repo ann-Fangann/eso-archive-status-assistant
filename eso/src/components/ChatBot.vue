@@ -14,6 +14,7 @@
               <div class="table-summary">
                 共查询到 {{ message.tableData.total }} 条数据
               </div>
+              <div v-if="message.text" class="text">{{ message.text }}</div>
               
               <!-- 列选择器 -->
               <div class="column-selector">
@@ -107,9 +108,6 @@
                     <div class="example-image" v-if="example.image">
                       <img :src="example.image" alt="回答样例" @click="showImagePreview(example.image)" class="clickable-image" @error="handleImageError" />
                     </div>
-                    <div class="example-placeholder" v-else>
-                      这里将展示图像样例
-                    </div>
                   </div>
                 </el-collapse-item>
               </el-collapse>
@@ -150,9 +148,8 @@
 <script setup>
 import { ref, nextTick } from 'vue'
 import { ElMessage, ElImageViewer } from 'element-plus'
-import { runWorkflow } from '../utils/dify.js'
+import axios from 'axios'
 import * as XLSX from 'xlsx-js-style'
-import exampleImage from '../assets/image.png' // 导入示例图像
 
 const messages = ref([])
 const inputMessage = ref('')
@@ -173,12 +170,11 @@ const scrollToBottom = () => {
 messages.value.push({
   type: 'received',
   sender: 'AI助手',
-  text: `您好！我是您的智能助手，可以帮您查询数据库中的信息。`,
+  text: `您好！我是您的数据助手，可以查询最近一次生成的 ESO 或图纸未完成清单。`,
   examples: [
-    {
-      question: "请帮我查询在2024年4月5号之前的数据",
-      image: exampleImage  // 使用导入的图像
-    }
+    { question: "ESO里面未完成的零件号告诉我" },
+    { question: "按工程师统计ESO未完成数量" },
+    { question: "按功能组统计图纸未完成数量" }
   ],
   timestamp: new Date().toLocaleTimeString(),
   // 确保消息对象包含时间戳
@@ -992,6 +988,81 @@ const parseTableData = (content) => {
   }
 }
 
+const buildTableData = (records = [], backendColumns = []) => {
+  if (!Array.isArray(records) || records.length === 0) {
+    return null
+  }
+
+  const keySet = new Set()
+  backendColumns.forEach(col => {
+    if (col?.prop) keySet.add(col.prop)
+  })
+  records.forEach(record => {
+    if (record && typeof record === 'object') {
+      Object.keys(record).forEach(key => keySet.add(key))
+    }
+  })
+
+  const fixedOrder = [
+    '零件号',
+    'FFC中文描述',
+    '功能组',
+    '工程师',
+    '未完成数量',
+    '数量',
+    'ESO_Plan_Date',
+    'ESO材料送检计划',
+    'ESO备注_类型',
+    '是否需要ESO_物流提供_',
+    'ESO_Actual_Date',
+    'ESO状态',
+    '未完成类型',
+    '数模状态',
+    '图纸状态',
+    '图纸要求完成日期',
+    '部门',
+    '延期未发布数量',
+    '首次申请项目'
+  ]
+
+  const orderedKeys = [
+    ...fixedOrder.filter(key => keySet.has(key)),
+    ...Array.from(keySet).filter(key => !fixedOrder.includes(key))
+  ]
+
+  const columns = orderedKeys.map(key => {
+    const backendColumn = backendColumns.find(col => col?.prop === key)
+    return backendColumn || {
+      prop: key,
+      label: key,
+      width: Math.min(Math.max(String(key).length * 10, 100), 220)
+    }
+  })
+
+  const defaultColumns = columns
+    .filter(col => fixedOrder.includes(col.prop))
+    .map(col => col.prop)
+
+  const pageSize = 10
+  const initialColumns = getInitialColumnSelection(
+    columns.map(c => c.prop),
+    defaultColumns.length ? defaultColumns : columns.slice(0, 8).map(c => c.prop)
+  )
+
+  return {
+    records,
+    displayRecords: records.slice(0, pageSize),
+    columns,
+    total: records.length,
+    pageSize,
+    currentPage: 1,
+    pagination: records.length > pageSize,
+    selectedColumns: initialColumns,
+    previousSelectedColumns: [...initialColumns],
+    exportAllColumns: false
+  }
+}
+
 const sendMessage = async () => {
   if (!inputMessage.value.trim() || sending.value) return
 
@@ -1012,100 +1083,28 @@ const sendMessage = async () => {
   try {
     sending.value = true
 
-    // 发送到Dify Workflow API
-    const response = await runWorkflow(userMessage)
-    console.log('Received response:', response)
+    const response = await axios.post('/api/smart-query/', {
+      question: userMessage
+    }, {
+      timeout: 120000
+    })
+    console.log('Received smart-query response:', response.data)
 
-    // 尝试解析表格数据
-    const tableData = parseTableData(response.content)
-
-    // 如果表格数据来自sheet表,额外获取功能组统计数据
-    if (tableData && tableData.total > 0) {
-      try {
-        // 检查是否有功能组列
-        const hasFunctionGroup = tableData.records.some(record =>
-          record.hasOwnProperty('功能组') || record.hasOwnProperty('部门')
-        )
-
-        if (hasFunctionGroup) {
-          let statsData = null
-
-          // 首先检查响应中是否已经包含group_stats
-          try {
-            const responseData = JSON.parse(response.content)
-            if (responseData.group_stats && responseData.group_stats.group_data) {
-              statsData = responseData.group_stats.group_data
-            }
-            // 如果没有group_stats,检查是否有ss_info,从ss_data中统计
-            else if (responseData.ss_info && responseData.ss_info.ss_data) {
-              const ssData = responseData.ss_info.ss_data
-              const groupStats = {}
-              for (const row of ssData) {
-                const 功能组 = row['功能组']
-                if (功能组) {
-                  groupStats[功能组] = (groupStats[功能组] || 0) + 1
-                }
-              }
-              statsData = Object.entries(groupStats).map(([k, v]) => ({
-                '部门': k,
-                '延期未发布数量': v
-              }))
-            }
-          } catch (e) {
-            console.log('解析响应数据失败:', e)
-          }
-
-          // 如果还是没有统计数据,则从tableData的records中统计功能组
-          if (!statsData) {
-            const groupStats = {}
-            for (const row of tableData.records) {
-              const 功能组 = row['功能组']
-              if (功能组) {
-                groupStats[功能组] = (groupStats[功能组] || 0) + 1
-              }
-            }
-            statsData = Object.entries(groupStats).map(([k, v]) => ({
-              '部门': k,
-              '延期未发布数量': v
-            }))
-          }
-
-          // 添加统计列到表格数据
-          if (statsData && statsData.length > 0) {
-            // 为前N行添加统计列(如果记录数少于统计条数,则为所有行)
-            const statsRowCount = Math.min(statsData.length, tableData.records.length)
-
-            for (let i = 0; i < statsRowCount; i++) {
-              tableData.records[i]['部门'] = statsData[i]['部门']
-              tableData.records[i]['延期未发布数量'] = statsData[i]['延期未发布数量']
-            }
-
-            // 更新列定义，确保包含"功能组统计"和"统计数量"列
-            if (!tableData.columns.find(c => c.prop === '部门')) {
-              tableData.columns.push({ prop: '部门', label: '部门', width: 120 })
-            }
-            if (!tableData.columns.find(c => c.prop === '延期未发布数量')) {
-              tableData.columns.push({ prop: '延期未发布数量', label: '延期未发布数量', width: 150 })
-            }
-          }
-        }
-      } catch (statsError) {
-        console.error('处理统计数据失败:', statsError)
-        // 不影响主流程,继续显示表格数据
-      }
-    }
+    const answer = response.data?.answer || '抱歉，我没有查询到结果。'
+    const backendTable = response.data?.table_data || {}
+    const tableData = buildTableData(backendTable.records || [], backendTable.columns || [])
 
     if (tableData && tableData.total > 0) {
       // 添加带表格的AI回复到聊天记录
       messages.value.push({
         type: 'received',
         sender: 'AI助手',
+        text: answer,
         tableData: tableData,
         timestamp: new Date().toLocaleTimeString()
       })
     } else {
       // 添加普通文本AI回复到聊天记录
-      const answer = response.content || '抱歉，我没有理解您的问题。'
       messages.value.push({
         type: 'received',
         sender: 'AI助手',
@@ -1115,13 +1114,14 @@ const sendMessage = async () => {
     }
   } catch (error) {
     console.error('发送消息失败:', error)
-    ElMessage.error('发送消息失败: ' + error.message)
+    const detail = error.response?.data?.detail || error.message
+    ElMessage.error('发送消息失败: ' + detail)
 
     // 添加错误消息到聊天记录
     messages.value.push({
       type: 'received',
       sender: '系统',
-      text: '抱歉，发送消息时出现错误，请稍后重试。',
+      text: `抱歉，查询时出现错误：${detail || '未知错误'}`,
       timestamp: new Date().toLocaleTimeString()
     })
   } finally {

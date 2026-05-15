@@ -6,7 +6,7 @@ import pandas as pd
 import xlsxwriter
 import os
 import logging
-from typing import List, Dict
+from typing import List, Dict, Any
 import json
 import io
 import re
@@ -44,7 +44,20 @@ app = FastAPI()
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-EMPTY_MARKERS = {"", "NA", "N/A", "NANA", "NONE", "NULL", "NAN"}
+EMPTY_MARKERS = {"", "NA", "N/A", "NANA", "NONE", "NULL", "NAN", "NAT", "<NA>", "-", "--"}
+
+ESO_MAIN_COLUMNS = [
+    '操作类型', '层级', '数据类型', '产品', '车型年', '零件号', '短SVPPS', 'FFC',
+    'FFC中文描述', '状态', '工程采购级别', '左右件', '功能组', '工程师代码',
+    '工程师', '工厂编号', '节点组', '本色件标识', 'TG2_Plan_Date', 'TG2_Actual_Date',
+    '2D_Drawing_Actual_Date', '2D_Drawing_No.', 'ESO_Plan_Date', 'ESO材料送检计划',
+    'ESO备注_类型', '是否需要ESO_物流提供_', 'ESO_Actual_Date', '备注', '首次申请项目', '首次应用项目'
+]
+
+LAST_ANALYSIS: Dict[str, Any] = {
+    "eso": None,
+    "drawing": None,
+}
 
 @app.post("/upload-excel/")
 async def upload_excel(file: UploadFile):
@@ -103,7 +116,7 @@ DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_NAME = os.getenv("DB_NAME", "ESO")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "123456")
-DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "3"))
 
 # 使用utf8mb4字符集以支持中文
 DATABASE_URL = URL.create(
@@ -309,6 +322,11 @@ def is_effective_value(value) -> bool:
     """判断业务字段是否有有效值，排除空值和 NA/NANA 等无需 ESO 标记。"""
     if value is None:
         return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
     value_str = str(value).strip()
     return value_str.upper() not in EMPTY_MARKERS
 
@@ -316,6 +334,11 @@ def normalize_part_no(value) -> str:
     """零件号匹配用标准化，避免 Excel 数字/空格导致匹配失败。"""
     if value is None:
         return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
     value_str = str(value).strip()
     if value_str.endswith(".0"):
         value_str = value_str[:-2]
@@ -324,9 +347,17 @@ def normalize_part_no(value) -> str:
 def parse_date_like_value(value):
     """将常见 Excel/字符串日期转成 date/datetime，无法识别时返回原值。"""
     if value is None or not is_effective_value(value):
-        return value
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
     if isinstance(value, (datetime, date)):
         return value
+
+    if isinstance(value, (int, float)) and 1 <= float(value) <= 60000:
+        try:
+            return pd.to_datetime(value, unit="D", origin="1899-12-30").to_pydatetime()
+        except Exception:
+            pass
 
     value_str = str(value).strip()
     value_str = value_str.split(" ")[0].replace("/", "-")
@@ -335,7 +366,21 @@ def parse_date_like_value(value):
             return datetime.strptime(value_str, fmt)
         except ValueError:
             continue
+    parsed = pd.to_datetime(value, errors="coerce")
+    if not pd.isna(parsed):
+        return parsed.to_pydatetime()
     return value
+
+def archive_date_sort_key(value):
+    """归档日期去重比较键，无法识别的日期排在最小。"""
+    parsed = parse_date_like_value(value)
+    if isinstance(parsed, pd.Timestamp):
+        return parsed.date()
+    if isinstance(parsed, datetime):
+        return parsed.date()
+    if isinstance(parsed, date):
+        return parsed
+    return date.min
 
 def resolve_target_date(target_date: str | None) -> date:
     """统计日期默认昨天；用户传入时按 YYYY-MM-DD 校验。"""
@@ -559,10 +604,13 @@ def build_archive_date_map(file_bytes: bytes):
         part_no = normalize_part_no(ws.cell(row=row, column=part_col).value)
         archive_cell = ws.cell(row=row, column=archive_col)
         if part_no and is_effective_value(archive_cell.value):
-            archive_map[part_no] = {
+            archive_info = {
                 "value": archive_cell.value,
                 "number_format": archive_cell.number_format,
             }
+            existing_info = archive_map.get(part_no)
+            if not existing_info or archive_date_sort_key(archive_info["value"]) >= archive_date_sort_key(existing_info["value"]):
+                archive_map[part_no] = archive_info
     return archive_map
 
 def create_modified_club_workbook(file_bytes: bytes, archive_map: Dict, original_filename: str):
@@ -611,6 +659,367 @@ def create_modified_club_workbook(file_bytes: bytes, archive_map: Dict, original
         "filled_count": filled_count,
         "delete_skipped_count": delete_skipped_count,
     }
+
+def to_jsonable_value(value):
+    """把 pandas/openpyxl 值转成 FastAPI 可安全返回的基础类型。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+def format_date_cell_value(value):
+    parsed = parse_date_like_value(value)
+    if isinstance(parsed, (datetime, date, pd.Timestamp)):
+        return to_jsonable_value(parsed)
+    return "" if not is_effective_value(parsed) else str(parsed).strip()
+
+def dataframe_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    records = []
+    for _, row in df.iterrows():
+        records.append({col: to_jsonable_value(row.get(col)) for col in df.columns})
+    return records
+
+def duplicate_part_stats_from_dataframe(df: pd.DataFrame):
+    if df is None or df.empty or '零件号' not in df.columns:
+        return {
+            "duplicate_part_count": 0,
+            "duplicate_row_count": 0,
+            "samples": [],
+        }
+
+    part_numbers = df['零件号'].apply(normalize_part_no)
+    counts = part_numbers[part_numbers != ""].value_counts()
+    duplicates = counts[counts > 1]
+    return {
+        "duplicate_part_count": int(len(duplicates)),
+        "duplicate_row_count": int(duplicates.sum()) if len(duplicates) else 0,
+        "samples": [
+            {"零件号": part_no, "count": int(count)}
+            for part_no, count in duplicates.head(20).items()
+        ],
+    }
+
+def read_eso_main_dataframe(file_bytes: bytes):
+    excel_file = io.BytesIO(file_bytes)
+    sheet_names = pd.ExcelFile(excel_file).sheet_names
+    if not sheet_names:
+        raise HTTPException(status_code=400, detail="零件俱乐部文件没有工作表")
+
+    sheet_name = sheet_names[0]
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=1)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="零件俱乐部第一个工作表为空")
+
+    original_columns = list(df.columns)
+    eso_column_names = [col for col in original_columns if isinstance(col, str) and 'ESO' in col.upper()]
+    df.columns = deduplicate_columns([sanitize_name(col, is_column=True) for col in df.columns])
+
+    available_columns = [col for col in ESO_MAIN_COLUMNS if col in df.columns]
+    eso_columns_in_required = {'ESO_Plan_Date', 'ESO_Actual_Date', 'ESO备注_类型', '是否需要ESO_物流提供_'}
+    for original_col in eso_column_names:
+        sanitized_name = sanitize_name(original_col, is_column=True)
+        if sanitized_name in eso_columns_in_required:
+            continue
+        if sanitized_name in df.columns and sanitized_name not in available_columns:
+            available_columns.append(sanitized_name)
+        elif sanitized_name not in df.columns:
+            for col in df.columns:
+                if (col.startswith(sanitized_name + '_') or sanitized_name in col) and col not in available_columns:
+                    available_columns.append(col)
+                    break
+
+    for first_project_col in ('首次申请项目', '首次应用项目'):
+        if first_project_col in df.columns and first_project_col not in available_columns:
+            available_columns.append(first_project_col)
+    if not available_columns:
+        available_columns = df.columns.tolist()
+
+    return df[available_columns].copy(), sheet_names
+
+def read_archive_dataframe(file_bytes: bytes):
+    excel_file = io.BytesIO(file_bytes)
+    sheet_names = pd.ExcelFile(excel_file).sheet_names
+    if not sheet_names:
+        raise HTTPException(status_code=400, detail="ESO零件清单文件没有工作表")
+
+    sheet_name = sheet_names[0]
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
+    if df.empty:
+        return df, sheet_names
+
+    df.columns = deduplicate_columns([sanitize_name(col, is_column=True) for col in df.columns])
+    return df, sheet_names
+
+def apply_archive_to_eso_dataframe(df: pd.DataFrame, archive_map: Dict):
+    if '零件号' not in df.columns or 'ESO_Actual_Date' not in df.columns:
+        return 0, 0
+
+    filled_count = 0
+    delete_skipped_count = 0
+    for idx, row in df.iterrows():
+        part_no = normalize_part_no(row.get('零件号'))
+        archive_info = archive_map.get(part_no)
+        if not archive_info:
+            continue
+
+        operation_value = str(row.get('操作类型') or "").strip().upper() if '操作类型' in df.columns else ""
+        if operation_value == "D":
+            delete_skipped_count += 1
+            continue
+
+        df.at[idx, 'ESO_Actual_Date'] = format_date_cell_value(archive_info["value"])
+        filled_count += 1
+
+    return filled_count, delete_skipped_count
+
+def build_eso_select_result_from_dataframe(
+    df: pd.DataFrame,
+    resolved_target_date: date,
+    matched_completed_count=None,
+    archive_df: pd.DataFrame | None = None,
+):
+    required_cols = ['零件号', 'ESO_Plan_Date', 'ESO_Actual_Date']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise HTTPException(status_code=400, detail=f"零件俱乐部缺少必要列: {missing_cols}")
+
+    rows = []
+    planned_count = 0
+    completed_count = 0
+    unfinished_count = 0
+    due_planned_count = 0
+    due_completed_count = 0
+    delete_row_count = 0
+    delete_completed_count = 0
+    delete_unfinished_excluded_count = 0
+    group_counter: Dict[str, int] = {}
+    group_col = '部门' if '部门' in df.columns else '功能组' if '功能组' in df.columns else None
+
+    for _, row in df.iterrows():
+        operation_value = str(row.get('操作类型') or "").strip().upper() if '操作类型' in df.columns else ""
+        is_delete = operation_value == "D"
+        plan_date = parse_date_to_date(row.get('ESO_Plan_Date'))
+        has_valid_plan = plan_date is not None and is_effective_value(row.get('ESO_Plan_Date'))
+        actual_filled = is_effective_value(row.get('ESO_Actual_Date'))
+        plan_due = has_valid_plan and plan_date <= resolved_target_date
+
+        if is_delete:
+            delete_row_count += 1
+            if actual_filled:
+                delete_completed_count += 1
+            if plan_due and not actual_filled:
+                delete_unfinished_excluded_count += 1
+            continue
+
+        if has_valid_plan:
+            planned_count += 1
+            if actual_filled:
+                completed_count += 1
+        if plan_due:
+            due_planned_count += 1
+            if actual_filled:
+                due_completed_count += 1
+
+        if plan_due and not actual_filled:
+            unfinished_count += 1
+            output_row = {col: to_jsonable_value(row.get(col)) for col in df.columns}
+            output_row["ESO状态"] = "审批中"
+            rows.append(output_row)
+            group_name = str(output_row.get(group_col) or f"未知{group_col or '功能组'}")
+            group_counter[group_name] = group_counter.get(group_name, 0) + 1
+
+    group_rows = [
+        {"功能组": key, "count": value}
+        for key, value in sorted(group_counter.items(), key=lambda item: item[1], reverse=True)
+    ]
+    duplicate_stats = {
+        "sheet": duplicate_part_stats_from_dataframe(df),
+        "sheet1": duplicate_part_stats_from_dataframe(archive_df) if archive_df is not None else {
+            "duplicate_part_count": 0,
+            "duplicate_row_count": 0,
+            "samples": [],
+        },
+    }
+
+    return {
+        "row_count": len(rows),
+        "total_empty_count": unfinished_count,
+        "data": rows,
+        "summary": {
+            "planned_count": planned_count,
+            "completed_count": completed_count,
+            "unfinished_count": unfinished_count,
+            "due_planned_count": due_planned_count,
+            "due_completed_count": due_completed_count,
+            "delete_row_count": delete_row_count,
+            "delete_completed_count": delete_completed_count,
+            "delete_unfinished_excluded_count": delete_unfinished_excluded_count,
+            "matched_completed_count": matched_completed_count,
+            "unfinished_by_difference": max(due_planned_count - due_completed_count, 0),
+            "target_date": resolved_target_date.isoformat(),
+            "formula": "ESO Plan Date <= 统计日期，ESO Actual Date 为空，且操作类型不是 D = 未完成数量",
+            "group_field": group_col or "功能组",
+        },
+        "group_stats": group_rows,
+        "duplicate_stats": duplicate_stats,
+    }
+
+def ensure_standard_tables(conn):
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS analysis_batches (
+        batch_id VARCHAR(64) PRIMARY KEY,
+        scene VARCHAR(32) NOT NULL,
+        target_date VARCHAR(20),
+        file1_name VARCHAR(255),
+        file2_name VARCHAR(255),
+        summary_json LONGTEXT,
+        created_at DATETIME NOT NULL
+    ) CHARACTER SET utf8mb4;
+    """))
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS analysis_unfinished_items (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        batch_id VARCHAR(64) NOT NULL,
+        scene VARCHAR(32) NOT NULL,
+        row_index INT NOT NULL,
+        part_no VARCHAR(255),
+        group_name VARCHAR(255),
+        engineer VARCHAR(255),
+        item_type VARCHAR(255),
+        status VARCHAR(255),
+        payload_json LONGTEXT,
+        created_at DATETIME NOT NULL,
+        INDEX idx_batch_scene (batch_id, scene),
+        INDEX idx_scene_part (scene, part_no)
+    ) CHARACTER SET utf8mb4;
+    """))
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS analysis_group_stats (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        batch_id VARCHAR(64) NOT NULL,
+        scene VARCHAR(32) NOT NULL,
+        group_name VARCHAR(255),
+        count_value INT NOT NULL,
+        created_at DATETIME NOT NULL,
+        INDEX idx_batch_scene (batch_id, scene)
+    ) CHARACTER SET utf8mb4;
+    """))
+
+def persist_standard_result(scene: str, file1_name: str, file2_name: str | None, select_result: Dict[str, Any]):
+    """MySQL 只做标准结果存储；连接失败不影响 Excel 处理主流程。"""
+    batch_id = uuid4().hex
+    now = datetime.now()
+    try:
+        with engine.begin() as conn:
+            ensure_standard_tables(conn)
+            conn.execute(text("""
+            INSERT INTO analysis_batches
+                (batch_id, scene, target_date, file1_name, file2_name, summary_json, created_at)
+            VALUES
+                (:batch_id, :scene, :target_date, :file1_name, :file2_name, :summary_json, :created_at)
+            """), {
+                "batch_id": batch_id,
+                "scene": scene,
+                "target_date": select_result.get("summary", {}).get("target_date"),
+                "file1_name": file1_name,
+                "file2_name": file2_name,
+                "summary_json": json.dumps(select_result.get("summary", {}), ensure_ascii=False, default=str),
+                "created_at": now,
+            })
+
+            item_rows = []
+            for idx, row in enumerate(select_result.get("data", []), start=1):
+                item_rows.append({
+                    "batch_id": batch_id,
+                    "scene": scene,
+                    "row_index": idx,
+                    "part_no": normalize_part_no(row.get("零件号")),
+                    "group_name": row.get("功能组") or row.get("部门") or "",
+                    "engineer": row.get("工程师") or "",
+                    "item_type": row.get("未完成类型") or "ESO未完成",
+                    "status": row.get("ESO状态") or row.get("图纸状态") or "审批中",
+                    "payload_json": json.dumps(row, ensure_ascii=False, default=str),
+                    "created_at": now,
+                })
+            if item_rows:
+                conn.execute(text("""
+                INSERT INTO analysis_unfinished_items
+                    (batch_id, scene, row_index, part_no, group_name, engineer, item_type, status, payload_json, created_at)
+                VALUES
+                    (:batch_id, :scene, :row_index, :part_no, :group_name, :engineer, :item_type, :status, :payload_json, :created_at)
+                """), item_rows)
+
+            stat_rows = [
+                {
+                    "batch_id": batch_id,
+                    "scene": scene,
+                    "group_name": item.get("功能组") or item.get("部门") or item.get("未完成类型") or "",
+                    "count_value": int(item.get("count") or item.get("延期未发布数量") or 0),
+                    "created_at": now,
+                }
+                for item in select_result.get("group_stats", [])
+            ]
+            if stat_rows:
+                conn.execute(text("""
+                INSERT INTO analysis_group_stats
+                    (batch_id, scene, group_name, count_value, created_at)
+                VALUES
+                    (:batch_id, :scene, :group_name, :count_value, :created_at)
+                """), stat_rows)
+
+        return {"saved": True, "batch_id": batch_id, "message": "结果已保存到 MySQL，智能问答可查询历史批次"}
+    except Exception as e:
+        logger.warning("标准结果保存到 MySQL 失败，主流程继续: %s", str(e))
+        return {"saved": False, "batch_id": None, "error": str(e), "message": "MySQL不可用，结果仅保存在当前服务内存中"}
+
+def process_eso_files(file1_bytes: bytes, file2_bytes: bytes, file1_name: str, file2_name: str, resolved_target_date: date):
+    main_df, sheet_names1 = read_eso_main_dataframe(file1_bytes)
+    archive_df, sheet_names2 = read_archive_dataframe(file2_bytes)
+    archive_map = build_archive_date_map(file2_bytes)
+    modified_workbook = create_modified_club_workbook(file1_bytes, archive_map, file1_name)
+    updated_row_count, delete_skipped_count = apply_archive_to_eso_dataframe(main_df, archive_map)
+    modified_workbook["filled_count"] = updated_row_count
+    modified_workbook["delete_skipped_count"] = delete_skipped_count
+
+    select_result = build_eso_select_result_from_dataframe(
+        main_df,
+        resolved_target_date,
+        matched_completed_count=updated_row_count,
+        archive_df=archive_df,
+    )
+    persistence = persist_standard_result("eso", file1_name, file2_name, select_result)
+    results = {
+        "sheet": f"成功处理 {len(main_df)} 行零件俱乐部数据",
+        "sheet1": f"成功处理 {len(archive_df)} 行ESO零件清单数据",
+    }
+    LAST_ANALYSIS["eso"] = {
+        "scene": "eso",
+        "df": main_df.copy(),
+        "archive_df": archive_df.copy(),
+        "file1": file1_name,
+        "file2": file2_name,
+        "sheet_names": sheet_names1 + sheet_names2,
+        "results": results,
+        "modified_workbook": modified_workbook,
+        "persistence": persistence,
+        "select_result": select_result,
+    }
+    return sheet_names1, sheet_names2, results, modified_workbook, select_result, persistence
 
 def split_dataframe_for_tables(df, table_names, max_cols_per_table=49):  # 保留1列给ID
     """
@@ -743,8 +1152,87 @@ def build_drawing_actual_map(file_bytes: bytes):
         part_no = normalize_part_no(row.get(part_col))
         actual_value = row.get(actual_col)
         if part_no and is_effective_value(actual_value):
-            actual_map[part_no] = actual_value
+            existing_value = actual_map.get(part_no)
+            if existing_value is None or archive_date_sort_key(actual_value) >= archive_date_sort_key(existing_value):
+                actual_map[part_no] = actual_value
     return actual_map
+
+def find_column_by_aliases(ws, header_row: int, aliases: List[str]):
+    alias_set = {sanitize_name(alias, is_column=True) for alias in aliases}
+    for cell in ws[header_row]:
+        sanitized = sanitize_name(cell.value, is_column=True)
+        if sanitized in alias_set:
+            return cell.column
+
+    lowered_aliases = [alias.lower() for alias in alias_set]
+    for cell in ws[header_row]:
+        sanitized = sanitize_name(cell.value, is_column=True).lower()
+        if any(alias and alias in sanitized for alias in lowered_aliases):
+            return cell.column
+    return None
+
+def detect_workbook_header_row(ws, candidates=(2, 1)):
+    for header_row in candidates:
+        part_col = find_column_by_aliases(ws, header_row, DRAWING_COLUMN_ALIASES["part_no"])
+        if part_col:
+            return header_row
+    return candidates[0]
+
+def create_modified_drawing_workbook(file_bytes: bytes, published_actual_map: Dict, original_filename: str):
+    """
+    在图纸/数模主清单上回填图纸实际日期。
+    若原表没有图纸实际日期列，则在末尾新增“图纸实际日期”列。
+    """
+    wb = load_workbook(io.BytesIO(file_bytes))
+    ws = wb[wb.sheetnames[0]]
+    header_row = detect_workbook_header_row(ws)
+    part_col = find_column_by_aliases(ws, header_row, DRAWING_COLUMN_ALIASES["part_no"])
+    actual_col = find_column_by_aliases(ws, header_row, DRAWING_COLUMN_ALIASES["drawing_actual"])
+    operation_col = find_column_by_aliases(ws, header_row, DRAWING_COLUMN_ALIASES["operation"])
+
+    if not part_col:
+        raise ValueError("图纸主清单缺少必要列：零件号")
+
+    if not actual_col:
+        actual_col = ws.max_column + 1
+        ws.cell(row=header_row, column=actual_col).value = "图纸实际日期"
+
+    filled_count = 0
+    delete_skipped_count = 0
+    for row in range(header_row + 1, ws.max_row + 1):
+        part_no = normalize_part_no(ws.cell(row=row, column=part_col).value)
+        if not part_no:
+            continue
+
+        operation_value = ""
+        if operation_col:
+            operation_value = str(ws.cell(row=row, column=operation_col).value or "").strip().upper()
+        if operation_value == "D":
+            delete_skipped_count += 1
+            continue
+
+        actual_value = published_actual_map.get(part_no)
+        if not is_effective_value(actual_value):
+            continue
+
+        actual_cell = ws.cell(row=row, column=actual_col)
+        if is_effective_value(actual_cell.value):
+            continue
+        actual_cell.value = parse_date_like_value(actual_value)
+        actual_cell.number_format = "yyyy/mm/dd"
+        filled_count += 1
+
+    safe_stem = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", Path(original_filename).stem)
+    output_name = f"{safe_stem}-已回填图纸实际日期-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}.xlsx"
+    output_path = OUTPUT_DIR / output_name
+    wb.save(output_path)
+
+    return {
+        "filename": output_name,
+        "download_url": f"/download/{output_name}",
+        "filled_count": filled_count,
+        "delete_skipped_count": delete_skipped_count,
+    }
 
 def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes: bytes | None, resolved_target_date: date):
     df = read_excel_with_header_candidates(club_file_bytes)
@@ -781,6 +1269,10 @@ def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes
     published_actual_map = build_drawing_actual_map(published_file_bytes) if published_file_bytes else {}
     rows = []
     delete_excluded_count = 0
+    model_due_count = 0
+    drawing_due_count = 0
+    model_completed_count = 0
+    drawing_completed_count = 0
 
     operation_col = detected.get("operation")
     group_col = detected.get("group")
@@ -806,6 +1298,11 @@ def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes
             drawing_actual_value = published_actual_map.get(part_no)
         drawing_actual_date = parse_date_to_date(drawing_actual_value)
 
+        if model_actual_date:
+            model_completed_count += 1
+        if drawing_actual_date:
+            drawing_completed_count += 1
+
         base_row = row.to_dict()
         base_row.update({
             "零件号": part_no,
@@ -814,6 +1311,9 @@ def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes
             "图纸号": row.get(drawing_no_col, "") if drawing_no_col else "",
             "图纸实际日期": drawing_actual_date.isoformat() if drawing_actual_date else "",
         })
+
+        if model_plan_date and model_plan_date <= resolved_target_date:
+            model_due_count += 1
 
         if model_plan_date and model_plan_date <= resolved_target_date and not model_actual_date:
             rows.append({
@@ -837,6 +1337,9 @@ def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes
             drawing_due_date = add_one_month(model_actual_date)
         elif drawing_plan_date:
             drawing_due_date = drawing_plan_date
+
+        if drawing_due_date and drawing_due_date <= resolved_target_date:
+            drawing_due_count += 1
 
         if drawing_due_date and drawing_due_date <= resolved_target_date and not drawing_actual_date:
             rows.append({
@@ -867,10 +1370,59 @@ def build_drawing_unfinished_result(club_file_bytes: bytes, published_file_bytes
             "target_date": resolved_target_date.isoformat(),
             "unfinished_count": len(rows),
             "delete_excluded_count": delete_excluded_count,
+            "model_due_count": model_due_count,
+            "model_completed_count": model_completed_count,
+            "drawing_due_count": drawing_due_count,
+            "drawing_completed_count": drawing_completed_count,
             "formula": "数模计划日期 <= 统计日期且数模未完成，或数模完成后一个月内图纸未发布；操作类型 D 不进入未完成清单",
             "detected_columns": detected,
         },
     }
+
+def process_drawing_files(
+    club_file_bytes: bytes,
+    published_file_bytes: bytes | None,
+    club_filename: str,
+    published_filename: str | None,
+    resolved_target_date: date,
+):
+    published_actual_map = build_drawing_actual_map(published_file_bytes) if published_file_bytes else {}
+    modified_workbook = None
+    if published_actual_map:
+        try:
+            modified_workbook = create_modified_drawing_workbook(club_file_bytes, published_actual_map, club_filename)
+        except Exception as workbook_error:
+            logger.error(f"生成回填后的图纸主清单失败: {str(workbook_error)}", exc_info=True)
+            modified_workbook = {
+                "error": f"生成回填后的图纸主清单失败: {str(workbook_error)}"
+            }
+    else:
+        modified_workbook = {
+            "error": "未提供可识别的图纸发布/归档日期清单，未生成回填文件"
+        }
+
+    select_result = build_drawing_unfinished_result(club_file_bytes, published_file_bytes, resolved_target_date)
+    if isinstance(modified_workbook, dict) and "filled_count" in modified_workbook:
+        select_result["summary"]["matched_completed_count"] = modified_workbook.get("filled_count", 0)
+        select_result["summary"]["delete_skipped_count"] = modified_workbook.get("delete_skipped_count", 0)
+
+    persistence = persist_standard_result(
+        "drawing",
+        club_filename,
+        published_filename,
+        select_result,
+    )
+    LAST_ANALYSIS["drawing"] = {
+        "scene": "drawing",
+        "file1": club_filename,
+        "file2": published_filename,
+        "club_bytes": club_file_bytes,
+        "published_bytes": published_file_bytes,
+        "modified_workbook": modified_workbook,
+        "select_result": select_result,
+        "persistence": persistence,
+    }
+    return select_result, modified_workbook, persistence
 
 @app.post("/upload-excel/", summary="上传Excel文件")
 async def upload_excel(file: UploadFile = File(...)):
@@ -1005,20 +1557,21 @@ async def upload_excel(file: UploadFile = File(...)):
         logger.error(f"处理失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
 
-@app.post("/upload-two-excel/", summary="上传两个Excel文件并执行SQL")
+@app.post("/upload-two-excel/", summary="上传两个Excel文件并生成ESO未完成清单")
 async def upload_two_excel(
     file1: UploadFile = File(...),
     file2: UploadFile = File(...),
     target_date: str = Form(None),
 ):
     """
-    上传两个Excel文件并将其数据导入MySQL数据库，然后执行指定的SQL操作
+    上传两个Excel文件并生成 ESO 未完成清单。
+
+    处理主流程不依赖 MySQL；MySQL 可用时只用于保存标准结果，供智能问答跨重启查询。
     
-    - 强制将第一个Excel文件导入为'sheet'表，第二个Excel文件导入为'sheet1'表
-    - 第一个文件从第二行开始读取列名，只导入指定的列；第二个文件按原有逻辑处理
-    - 第一行将作为数据库字段名
-    - 会删除已存在的同名表
-    - 导入完成后执行更新和查询操作
+    - 第一个文件从第二行开始读取列名，并按会议确认字段生成 ESO 清单
+    - 第二个文件读取零件号与归档日期，用于回填 ESO Actual Date
+    - 操作类型为 D 的行不回填、不进入未完成清单
+    - 返回结构保留 sql_results 字段，用于兼容现有前端展示
     """
     logger.info(f"收到两个上传请求，文件1: {file1.filename}, 文件2: {file2.filename}")
     
@@ -1033,6 +1586,35 @@ async def upload_two_excel(
     try:
         resolved_target_date = resolve_target_date(target_date)
         logger.info(f"未完成清单统计日期: {resolved_target_date.isoformat()}")
+
+        contents1 = await file1.read()
+        contents2 = await file2.read()
+        sheet_names1, sheet_names2, results, modified_workbook, select_result, persistence = process_eso_files(
+            contents1,
+            contents2,
+            file1.filename,
+            file2.filename,
+            resolved_target_date,
+        )
+
+        logger.info(
+            "ESO文件处理完成，未完成 %s 条，MySQL保存状态: %s",
+            select_result.get("row_count"),
+            persistence.get("saved"),
+        )
+        return {
+            "file1": file1.filename,
+            "file2": file2.filename,
+            "target_date": resolved_target_date.isoformat(),
+            "sheets": len(sheet_names1) + len(sheet_names2),
+            "results": results,
+            "modified_workbook": modified_workbook,
+            "persistence": persistence,
+            "sql_results": {
+                "update_result": f"成功按Python规则回填 {modified_workbook.get('filled_count', 0)} 条记录",
+                "select_result": select_result
+            }
+        }
 
         # 处理第一个文件 - 强制导入为 'sheet' 表，但只导入指定列，从第二行开始读取列名
         logger.info(f"开始处理文件1: {file1.filename}")
@@ -1471,15 +2053,25 @@ async def upload_two_excel(
 @app.post("/unfinished-list/", summary="按统计日期重新生成未完成清单")
 async def regenerate_unfinished_list(target_date: str = Body(None, embed=True)):
     """
-    基于已经导入并回填后的 sheet 表，重新计算未完成清单。
-    不重新上传 Excel，不重新入库，不重新执行回填。
+    基于当前服务内存中的最新 ESO 处理结果，按统计日期重新计算未完成清单。
+    MySQL 不再是重新生成清单的前置依赖。
     """
     resolved_target_date = resolve_target_date(target_date)
     logger.info(f"重新生成未完成清单，统计日期: {resolved_target_date.isoformat()}")
 
     try:
-        with engine.connect() as conn:
-            select_result = build_unfinished_select_result(conn, resolved_target_date)
+        context = LAST_ANALYSIS.get("eso")
+        if not context or context.get("df") is None:
+            raise HTTPException(status_code=400, detail="请先上传并处理 ESO Excel 文件，再重新生成未完成清单")
+
+        previous_summary = context.get("select_result", {}).get("summary", {})
+        select_result = build_eso_select_result_from_dataframe(
+            context["df"],
+            resolved_target_date,
+            matched_completed_count=previous_summary.get("matched_completed_count"),
+            archive_df=context.get("archive_df"),
+        )
+        context["select_result"] = select_result
 
         return {
             "target_date": resolved_target_date.isoformat(),
@@ -1513,18 +2105,224 @@ async def upload_drawing_excel(
         resolved_target_date = resolve_target_date(target_date)
         club_contents = await club_file.read()
         published_contents = await published_file.read() if published_file else None
-        result = build_drawing_unfinished_result(club_contents, published_contents, resolved_target_date)
+        result, modified_workbook, persistence = process_drawing_files(
+            club_contents,
+            published_contents,
+            club_file.filename,
+            published_file.filename if published_file else None,
+            resolved_target_date,
+        )
         return {
             "club_file": club_file.filename,
             "published_file": published_file.filename if published_file else None,
             "target_date": resolved_target_date.isoformat(),
             "select_result": result,
+            "modified_workbook": modified_workbook,
+            "persistence": persistence,
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"图纸未完成清单生成失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"图纸未完成清单生成失败: {str(e)}")
+
+@app.post("/drawing-unfinished-list/", summary="按统计日期重新生成图纸未完成清单")
+async def regenerate_drawing_unfinished_list(target_date: str = Body(None, embed=True)):
+    """
+    基于当前服务内存中的最新图纸文件，按统计日期重新计算图纸未完成清单。
+    不重新上传 Excel，不重新生成回填文件。
+    """
+    resolved_target_date = resolve_target_date(target_date)
+    logger.info(f"重新生成图纸未完成清单，统计日期: {resolved_target_date.isoformat()}")
+
+    try:
+        context = LAST_ANALYSIS.get("drawing")
+        if not context or context.get("club_bytes") is None:
+            raise HTTPException(status_code=400, detail="请先上传并处理图纸 Excel 文件，再重新生成未完成清单")
+
+        select_result = build_drawing_unfinished_result(
+            context["club_bytes"],
+            context.get("published_bytes"),
+            resolved_target_date,
+        )
+        previous_summary = context.get("select_result", {}).get("summary", {})
+        if previous_summary.get("matched_completed_count") is not None:
+            select_result["summary"]["matched_completed_count"] = previous_summary.get("matched_completed_count")
+        if previous_summary.get("delete_skipped_count") is not None:
+            select_result["summary"]["delete_skipped_count"] = previous_summary.get("delete_skipped_count")
+        context["select_result"] = select_result
+
+        return {
+            "target_date": resolved_target_date.isoformat(),
+            "select_result": select_result,
+            "modified_workbook": context.get("modified_workbook"),
+            "persistence": context.get("persistence"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"重新生成图纸未完成清单失败: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"重新生成图纸未完成清单失败: {str(e)}")
+
+def load_latest_standard_result_from_mysql(scene: str):
+    try:
+        with engine.connect() as conn:
+            batch = conn.execute(text("""
+            SELECT batch_id, summary_json
+            FROM analysis_batches
+            WHERE scene = :scene
+            ORDER BY created_at DESC
+            LIMIT 1
+            """), {"scene": scene}).mappings().first()
+            if not batch:
+                return None
+
+            item_rows = conn.execute(text("""
+            SELECT payload_json
+            FROM analysis_unfinished_items
+            WHERE scene = :scene AND batch_id = :batch_id
+            ORDER BY row_index ASC
+            """), {"scene": scene, "batch_id": batch["batch_id"]}).mappings().all()
+            group_rows = conn.execute(text("""
+            SELECT group_name, count_value
+            FROM analysis_group_stats
+            WHERE scene = :scene AND batch_id = :batch_id
+            ORDER BY count_value DESC
+            """), {"scene": scene, "batch_id": batch["batch_id"]}).mappings().all()
+
+            data = [json.loads(row["payload_json"]) for row in item_rows]
+            summary = json.loads(batch["summary_json"] or "{}")
+            group_stats = [{"功能组": row["group_name"], "count": int(row["count_value"])} for row in group_rows]
+            return {
+                "data": data,
+                "row_count": len(data),
+                "total_empty_count": len(data),
+                "summary": summary,
+                "group_stats": group_stats,
+            }
+    except Exception as e:
+        logger.info("从MySQL读取最新标准结果失败: %s", str(e))
+        return None
+
+def get_latest_select_result(scene: str):
+    context = LAST_ANALYSIS.get(scene)
+    if context and context.get("select_result"):
+        return context["select_result"], "memory"
+
+    result = load_latest_standard_result_from_mysql(scene)
+    if result:
+        return result, "mysql"
+    return None, None
+
+def infer_scene(question: str, requested_scene: str | None = None):
+    if requested_scene in {"eso", "drawing"}:
+        return requested_scene
+    lower_question = question.lower()
+    if "图纸" in question or "数模" in question or "drawing" in lower_question:
+        return "drawing"
+    return "eso"
+
+def make_table_data(records: List[Dict[str, Any]]):
+    columns = []
+    if records:
+        for key in records[0].keys():
+            columns.append({
+                "prop": key,
+                "label": key,
+                "width": min(max(len(str(key)) * 10, 100), 220),
+            })
+    return {
+        "records": records,
+        "columns": columns,
+        "total": len(records),
+    }
+
+def answer_smart_question(question: str, scene: str | None = None):
+    resolved_scene = infer_scene(question, scene)
+    select_result, source = get_latest_select_result(resolved_scene)
+    if not select_result:
+        return {
+            "answer": "当前还没有可查询的数据。请先在对应页面上传并生成未完成清单；如果需要历史查询，请确认 MySQL 已启动并已保存过结果。",
+            "scene": resolved_scene,
+            "source": None,
+            "table_data": make_table_data([]),
+        }
+
+    rows = select_result.get("data", [])
+    summary = select_result.get("summary", {})
+    question_text = question.strip()
+    lower_question = question_text.lower()
+    wants_engineer = "工程师" in question_text or "engineer" in lower_question
+    wants_group = "功能组" in question_text or "部门" in question_text or "group" in lower_question
+    wants_type = "类型" in question_text or "数模" in question_text or "图纸" in question_text
+    wants_part_no = "零件号" in question_text or "part" in lower_question
+    wants_count = any(token in question_text for token in ["统计", "数量", "多少", "几个", "汇总"])
+    wants_detail = any(token in question_text for token in ["明细", "清单", "告诉我", "有哪些", "列出", "全部"])
+
+    if wants_engineer and wants_count:
+        counter: Dict[str, int] = {}
+        for row in rows:
+            key = str(row.get("工程师") or "未知工程师")
+            counter[key] = counter.get(key, 0) + 1
+        records = [{"工程师": key, "未完成数量": value} for key, value in sorted(counter.items(), key=lambda item: item[1], reverse=True)]
+        answer = f"{'ESO' if resolved_scene == 'eso' else '图纸'}未完成按工程师统计共 {len(records)} 位工程师，合计 {len(rows)} 项。"
+        return {"answer": answer, "scene": resolved_scene, "source": source, "table_data": make_table_data(records)}
+
+    if wants_group and wants_count:
+        records = [
+            {"功能组": item.get("功能组") or item.get("部门") or "未知功能组", "未完成数量": item.get("count", 0)}
+            for item in select_result.get("group_stats", [])
+        ]
+        if not records:
+            counter: Dict[str, int] = {}
+            for row in rows:
+                key = str(row.get("功能组") or row.get("部门") or "未知功能组")
+                counter[key] = counter.get(key, 0) + 1
+            records = [{"功能组": key, "未完成数量": value} for key, value in sorted(counter.items(), key=lambda item: item[1], reverse=True)]
+        answer = f"{'ESO' if resolved_scene == 'eso' else '图纸'}未完成按功能组统计合计 {len(rows)} 项。"
+        return {"answer": answer, "scene": resolved_scene, "source": source, "table_data": make_table_data(records)}
+
+    if resolved_scene == "drawing" and wants_type and wants_count:
+        counter: Dict[str, int] = {}
+        for row in rows:
+            key = str(row.get("未完成类型") or "未知类型")
+            counter[key] = counter.get(key, 0) + 1
+        records = [{"未完成类型": key, "数量": value} for key, value in sorted(counter.items(), key=lambda item: item[1], reverse=True)]
+        return {"answer": f"图纸未完成按类型统计合计 {len(rows)} 项。", "scene": resolved_scene, "source": source, "table_data": make_table_data(records)}
+
+    if wants_part_no:
+        records = [{"零件号": row.get("零件号", "")} for row in rows if row.get("零件号")]
+        answer = f"{'ESO' if resolved_scene == 'eso' else '图纸'}当前未完成零件号共 {len(records)} 个。"
+        return {"answer": answer, "scene": resolved_scene, "source": source, "table_data": make_table_data(records)}
+
+    if wants_count and not wants_detail:
+        records = [{
+            "场景": "ESO" if resolved_scene == "eso" else "图纸",
+            "统计日期": summary.get("target_date", ""),
+            "未完成数量": summary.get("unfinished_count", len(rows)),
+            "统计口径": summary.get("formula", ""),
+        }]
+        return {"answer": f"当前未完成数量为 {summary.get('unfinished_count', len(rows))} 项。", "scene": resolved_scene, "source": source, "table_data": make_table_data(records)}
+
+    default_columns = ["零件号", "功能组", "工程师", "ESO_Plan_Date", "ESO_Actual_Date", "ESO状态"] if resolved_scene == "eso" else ["零件号", "功能组", "工程师", "未完成类型", "数模状态", "图纸状态", "图纸要求完成日期"]
+    records = []
+    for row in rows:
+        records.append({col: row.get(col, "") for col in default_columns if col in row})
+    answer = f"已查询到{'ESO' if resolved_scene == 'eso' else '图纸'}未完成清单 {len(records)} 条。"
+    return {"answer": answer, "scene": resolved_scene, "source": source, "table_data": make_table_data(records)}
+
+@app.post("/smart-query/", summary="受控智能问答")
+async def smart_query(
+    question: str = Body(..., embed=True),
+    scene: str = Body(None, embed=True),
+):
+    if not question or not question.strip():
+        raise HTTPException(status_code=400, detail="问题不能为空")
+    try:
+        return answer_smart_question(question, scene)
+    except Exception as e:
+        logger.error(f"智能问答失败: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"智能问答失败: {str(e)}")
 
 @app.get("/download/{filename}", summary="下载生成的Excel文件")
 async def download_generated_file(filename: str):
@@ -1637,8 +2435,8 @@ async def health_check():
             logger.info("数据库连接测试成功")
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
-        logger.error(f"数据库连接测试失败: {str(e)}", exc_info=True)
-        return {"status": "unhealthy", "database_error": str(e)}
+        logger.warning(f"数据库连接测试失败，核心Excel处理仍可用: {str(e)}")
+        return {"status": "healthy", "database": "optional_unavailable", "database_error": str(e)}
 
 @app.on_event("startup")
 async def startup_event():
@@ -1649,7 +2447,7 @@ async def startup_event():
             result = conn.execute(text("SELECT 1"))
         logger.info("数据库连接初始化成功")
     except Exception as e:
-        logger.error(f"数据库连接初始化失败: {str(e)}")
+        logger.warning(f"数据库连接初始化失败，MySQL持久化和跨重启问答不可用: {str(e)}")
         
 @app.on_event("shutdown")
 async def shutdown_event():

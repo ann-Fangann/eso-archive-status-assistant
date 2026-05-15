@@ -104,6 +104,15 @@
           <el-descriptions-item label="工作表数量">{{ uploadResult.sheets }}</el-descriptions-item>
         </el-descriptions>
 
+        <el-alert
+          v-if="uploadResult.persistence"
+          :title="uploadResult.persistence.message"
+          :type="uploadResult.persistence.saved ? 'success' : 'warning'"
+          show-icon
+          :closable="false"
+          style="margin-top: 16px;"
+        />
+
         <div v-if="uploadResult.modified_workbook" style="margin-top: 16px;">
           <el-alert
             v-if="uploadResult.modified_workbook.error"
@@ -340,59 +349,24 @@ const reportText = computed(() => {
 
 const columnLabelMap: Record<string, string> = {
   'ESO备注_类型': 'ESO备注',
-  '首次申请项目': '首次申请项目',
-  'ESO_Plan_Date': 'ESO Plan Date',
-  'ESO_Actual_Date': 'ESO Actual Date',
+  '首次申请项目': '首次应用项目',
+  '首次应用项目': '首次应用项目',
+  'ESO_Plan_Date': 'ESO计划',
+  'ESO_Actual_Date': 'ESO实际归档日期',
   '是否需要ESO_物流提供_': '是否需要ESO',
   't_2D_Drawing_No_': '2D Drawing No.',
   'ESO状态': 'ESO状态'
 }
 
-const preferredUnfinishedColumns = [
-  '操作类型',
-  '层级',
-  '数据类型',
-  '产品',
-  '车型年',
-  '零件号',
-  '短SVPPS',
-  'FFC',
-  'FFC中文描述',
-  '状态',
-  '工程采购级别',
-  '左右件',
-  '功能组',
-  '工程师代码',
-  '工程师',
-  '工厂编号',
-  '节点组',
-  '本色件标识',
-  'TG2_Plan_Date',
-  'TG2_Actual_Date',
-  '2D_Drawing_Actual_Date',
-  't_2D_Drawing_No_',
-  'ESO_Plan_Date',
-  'ESO材料送检计划',
-  'ESO备注_类型',
-  '是否需要ESO_物流提供_',
-  'ESO_Actual_Date',
-  '备注',
-  '首次申请项目',
-  'ESO状态'
-]
-
 const defaultUnfinishedColumns = [
-  '操作类型',
-  '产品',
-  '车型年',
   '零件号',
-  '功能组',
+  'FFC中文描述',
   '工程师',
-  'ESO_Plan_Date',
-  'ESO_Actual_Date',
-  'ESO备注_类型',
+  '功能组',
   '首次申请项目',
-  'ESO状态'
+  '首次应用项目',
+  'ESO_Plan_Date',
+  'ESO_Actual_Date'
 ]
 
 const selectedUnfinishedColumns = ref<string[]>([])
@@ -419,9 +393,16 @@ const allUnfinishedColumns = computed(() => {
     Object.keys(row).forEach(key => keySet.add(key))
   })
 
+  const defaultKeys = defaultUnfinishedColumns.filter(key => keySet.has(key))
+  const esoKeys = Array.from(keySet).filter(key => {
+    const isDefault = defaultKeys.includes(key)
+    const isEsoColumn = key.toUpperCase().includes('ESO')
+    return !isDefault && isEsoColumn
+  })
+
   const orderedKeys = [
-    ...preferredUnfinishedColumns.filter(key => keySet.has(key)),
-    ...Array.from(keySet).filter(key => !preferredUnfinishedColumns.includes(key))
+    ...defaultKeys,
+    ...esoKeys.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
   ]
 
   return orderedKeys.map(prop => ({
@@ -457,7 +438,7 @@ const targetDate = ref(getYesterday())
 
 const getSavedUnfinishedColumnSelection = () => {
   try {
-    const saved = localStorage.getItem('eso_unfinished_columns')
+    const saved = localStorage.getItem('eso_unfinished_columns_v2')
     return saved ? JSON.parse(saved) : []
   } catch (error) {
     console.error('读取未完成清单列选择失败:', error)
@@ -466,7 +447,7 @@ const getSavedUnfinishedColumnSelection = () => {
 }
 
 const saveUnfinishedColumnSelection = () => {
-  localStorage.setItem('eso_unfinished_columns', JSON.stringify(selectedUnfinishedColumns.value))
+  localStorage.setItem('eso_unfinished_columns_v2', JSON.stringify(selectedUnfinishedColumns.value))
 }
 
 const resetUnfinishedColumnSelection = () => {
