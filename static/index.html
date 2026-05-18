@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ESO v3.0 智能归档助手</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">E3</div>
+          <div>
+            <h1>ESO v3.0</h1>
+            <p>智能归档状态工作台</p>
+          </div>
+        </div>
+        <nav class="scene-tabs">
+          <button class="scene-tab active" data-scene="eso">ESO未完成</button>
+          <button class="scene-tab" data-scene="drawing">图纸/数模未完成</button>
+        </nav>
+        <div class="side-note">
+          <strong>设计原则</strong>
+          <span>LLM 只做语义映射和问题理解，统计口径由确定性代码执行。</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section class="topbar">
+          <div>
+            <p class="eyebrow">Semantic Mapping + Deterministic Engine</p>
+            <h2 id="page-title">ESO未完成清单</h2>
+          </div>
+          <a id="export-link" class="ghost-link disabled" href="#" target="_blank">导出结果</a>
+        </section>
+
+        <section class="panel upload-panel">
+          <form id="analysis-form">
+            <div class="form-grid">
+              <label class="field">
+                <span>统计日期</span>
+                <input id="target-date" name="target_date" type="date" />
+              </label>
+              <label class="file-field">
+                <span id="primary-label">主清单</span>
+                <input id="primary-file" name="primary_file" type="file" accept=".xlsx,.xls" required />
+              </label>
+              <label class="file-field">
+                <span id="archive-label">归档清单（可选）</span>
+                <input id="archive-file" name="archive_file" type="file" accept=".xlsx,.xls" />
+              </label>
+            </div>
+            <button id="analyze-button" class="primary-button" type="submit">开始智能识别并生成清单</button>
+          </form>
+          <div id="status" class="status hidden"></div>
+        </section>
+
+        <section class="content-grid">
+          <div class="left-stack">
+            <section class="panel">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Mapping Review</p>
+                  <h3>字段语义映射</h3>
+                </div>
+                <span id="mapping-score" class="badge">等待上传</span>
+              </div>
+              <div id="warnings" class="warnings"></div>
+              <div id="mapping-list" class="mapping-list empty-state">上传 Excel 后会显示标准字段、匹配列和置信度。</div>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Result</p>
+                  <h3>汇总结果</h3>
+                </div>
+              </div>
+              <div id="summary-cards" class="summary-grid empty-state">暂无结果。</div>
+              <div id="stats-area" class="stats-area"></div>
+            </section>
+          </div>
+
+          <section class="panel chat-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Controlled Agent</p>
+                <h3>智能问答</h3>
+              </div>
+            </div>
+            <div id="chat-history" class="chat-history">
+              <div class="message assistant">
+                <div class="bubble">
+                  上传并生成清单后，可以问：按工程师统计、某个功能组有哪些未完成、当前总数是多少。
+                </div>
+              </div>
+            </div>
+            <form id="chat-form" class="chat-input">
+              <textarea id="chat-question" rows="3" placeholder="输入问题，例如：按功能组统计未完成数量"></textarea>
+              <button id="send-button" type="submit">发送</button>
+            </form>
+          </section>
+        </section>
+
+        <section class="panel table-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Unfinished Items</p>
+              <h3>未完成明细</h3>
+            </div>
+            <span id="row-count" class="badge">0 条</span>
+          </div>
+          <div id="result-table" class="table-wrap empty-state">暂无未完成明细。</div>
+        </section>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
